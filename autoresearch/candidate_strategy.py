@@ -33,7 +33,7 @@ NWS_OFFICIAL_WEIGHT = 0.7
 
 # City weights: relative weight for position sizing per city.
 # Higher weight = trade more contracts in that city.
-CITY_WEIGHT_NYC = 0.8
+CITY_WEIGHT_NYC = 1.2
 CITY_WEIGHT_CHI = 0.8
 CITY_WEIGHT_MIA = 1.0
 CITY_WEIGHT_LA = 1.0
