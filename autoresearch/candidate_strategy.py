@@ -15,7 +15,7 @@ AutoResearch will evolve it automatically overnight.
 
 # Forecast uncertainty: standard deviation in degrees F for NWS forecasts
 # Keyed by days_out. Lower = more aggressive (tighter model), higher = more conservative.
-FORECAST_STDEV_0 = 1.5   # Same day
+FORECAST_STDEV_0 = 1.0  # Same day
 FORECAST_STDEV_1 = 2.5   # Tomorrow
 FORECAST_STDEV_2 = 3.5   # Day after tomorrow
 FORECAST_STDEV_3 = 4.5   # 3 days out
