@@ -1,0 +1,20 @@
+[Unit]
+Description=Ippo Auto Trade - Autonomous trading session
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ippo
+ExecStart=/opt/ippo/.venv/bin/python /opt/ippo/auto_trade.py --live --no-confirm
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=600
+
+# Resource limits
+MemoryMax=1G
+
+StandardOutput=append:/opt/ippo/output/auto_trade_systemd.log
+StandardError=append:/opt/ippo/output/auto_trade_systemd.log
+
+[Install]
+WantedBy=default.target

@@ -67,21 +67,29 @@ MIN_EDGE_THRESHOLD = 0.05  # 5 cents minimum edge
 # MARKET FILTERS — High-volume, fast-settling markets only
 # =============================================================================
 TARGET_MARKET_SERIES = [
-    "KXHIGH",       # Daily weather highs (settles daily)
-    "KXLOW",        # Daily weather lows (settles daily)
-    "NCAA",          # Men's College Basketball
-    "NBAMVP",        # NBA markets
-    "BTC",           # Bitcoin hourly/daily
-    "ETH",           # Ethereum hourly/daily
-    "INX",           # S&P 500 range markets
-    "NASDAQ",        # Nasdaq range markets
+    "KXHIGHNY",     # NYC daily high temp (settles daily, high volume)
+    "KXHIGHCHI",    # Chicago daily high temp (settles daily, high volume)
+    "KXHIGHLA",     # LA daily high temp
+    "KXHIGHMIA",    # Miami daily high temp
+    "KXHIGHDC",     # Washington DC daily high temp
+    "KXHIGHDEN",    # Denver daily high temp
+    "KXNBA",         # NBA (high volume)
+    "KXNHL",         # NHL (very high volume)
+    "KXMLB",         # MLB (high volume)
+    "KXNCAAB",       # NCAA Basketball
+    "KXBTC",         # Bitcoin daily range
+    "KXETH",         # Ethereum daily range
+    "KXSOL",         # Solana daily range
+    "KXNBAGAME",     # NBA individual games
+    "KXNBAPTS",      # NBA player points
+    "KXMARMAD",      # March Madness
 ]
 
 # Only trade markets with volume above this threshold
 MIN_MARKET_VOLUME = 50
 
 # Only trade markets settling within this many hours
-MAX_HOURS_TO_SETTLEMENT = 48
+MAX_HOURS_TO_SETTLEMENT = 720  # 30 days — filter less aggressively to find active markets
 
 # =============================================================================
 # AUTORESEARCH SETTINGS

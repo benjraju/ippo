@@ -1,0 +1,23 @@
+[Unit]
+Description=Ippo Arb Runner - Continuous YES/NO arbitrage scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ippo
+ExecStart=/opt/ippo/.venv/bin/python /opt/ippo/arb_runner.py --dry-run
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+
+# Logging
+StandardOutput=append:/opt/ippo/output/arb_runner_systemd.log
+StandardError=append:/opt/ippo/output/arb_runner_systemd.log
+
+[Install]
+WantedBy=default.target

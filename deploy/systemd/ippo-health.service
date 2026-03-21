@@ -1,0 +1,17 @@
+[Unit]
+Description=Ippo Health Check - HTTP endpoint for uptime monitoring
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ippo
+ExecStart=/opt/ippo/.venv/bin/python /opt/ippo/health_check.py --port 8787
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+MemoryMax=128M
+
+[Install]
+WantedBy=default.target

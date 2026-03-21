@@ -1,0 +1,9 @@
+[Unit]
+Description=Ippo Settlement Timer - Check every 4 hours
+
+[Timer]
+OnCalendar=*-*-* 02,06,10,14,18,22:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

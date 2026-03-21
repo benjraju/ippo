@@ -1,0 +1,20 @@
+[Unit]
+Description=Ippo Telegram Bot - Interactive command handler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ippo
+ExecStart=/opt/ippo/.venv/bin/python /opt/ippo/telegram_bot.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+MemoryMax=256M
+
+StandardOutput=append:/opt/ippo/output/telegram_bot.log
+StandardError=append:/opt/ippo/output/telegram_bot.log
+
+[Install]
+WantedBy=default.target

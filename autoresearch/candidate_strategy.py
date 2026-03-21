@@ -46,7 +46,7 @@ BUCKET_MULTIPLIER = 1.0
 THRESHOLD_MULTIPLIER = 1.0
 
 # Confidence thresholds (edge in cents)
-HIGH_CONFIDENCE_EDGE = 10.0   # Above this = "high" confidence
+HIGH_CONFIDENCE_EDGE = 7.0  # Above this = "high" confidence
 MEDIUM_CONFIDENCE_EDGE = 5.0  # Above this = "medium" confidence
 
 # Maximum position per single market (dollars)

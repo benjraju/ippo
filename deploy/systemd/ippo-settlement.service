@@ -1,0 +1,17 @@
+[Unit]
+Description=Ippo Settlement Tracker - Check settled trades and P&L
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ippo
+ExecStart=/opt/ippo/.venv/bin/python -c "from settlement_tracker import SettlementTracker; t=SettlementTracker(); t.check_settlements(); t.daily_summary()"
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=300
+
+StandardOutput=append:/opt/ippo/output/settlement_systemd.log
+StandardError=append:/opt/ippo/output/settlement_systemd.log
+
+[Install]
+WantedBy=default.target

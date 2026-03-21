@@ -38,10 +38,33 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import config
 
+try:
+    from alerts import alert_research_improvement
+except (ImportError, OSError):
+    alert_research_improvement = None
+
+try:
+    from kalshi_client import KalshiClient
+except ImportError:
+    KalshiClient = None
+
+try:
+    from settlement_tracker import (
+        fetch_actual_high_temp,
+        NWS_OBSERVATION_STATIONS,
+        SERIES_TO_CITY,
+    )
+except ImportError:
+    fetch_actual_high_temp = None
+    NWS_OBSERVATION_STATIONS = {}
+    SERIES_TO_CITY = {}
+
 console = Console()
 
 STRATEGY_FILE = Path(__file__).parent / "candidate_strategy.py"
 RESULTS_LOG = Path(__file__).parent / "results.log"
+REAL_OUTCOMES_FILE = Path(__file__).parent / "real_outcomes.json"
+KALSHI_CACHE_FILE = Path(__file__).parent / "kalshi_cache.json"
 
 # =============================================================================
 # WEATHER-SPECIFIC MUTATION SPACE
@@ -64,6 +87,8 @@ MUTATION_SPACE = {
     "CITY_WEIGHT_CHI": [0.5, 0.8, 1.0, 1.2, 1.5],
     "CITY_WEIGHT_MIA": [0.5, 0.8, 1.0, 1.2, 1.5],
     "CITY_WEIGHT_LA": [0.5, 0.8, 1.0, 1.2, 1.5],
+    "CITY_WEIGHT_DC": [0.5, 0.8, 1.0, 1.2, 1.5],
+    "CITY_WEIGHT_DEN": [0.5, 0.8, 1.0, 1.2, 1.5],
     # Bucket vs threshold preference
     "BUCKET_MULTIPLIER": [0.5, 0.8, 1.0, 1.2, 1.5, 2.0],
     "THRESHOLD_MULTIPLIER": [0.5, 0.8, 1.0, 1.2, 1.5, 2.0],
@@ -96,6 +121,8 @@ CITIES = [
     {"name": "Chicago", "base_temp_range": (15, 95), "ticker_prefix": "KXHIGHCHI"},
     {"name": "Miami", "base_temp_range": (60, 95), "ticker_prefix": "KXHIGHMIA"},
     {"name": "LA", "base_temp_range": (55, 95), "ticker_prefix": "KXHIGHLA"},
+    {"name": "DC", "base_temp_range": (25, 100), "ticker_prefix": "KXHIGHDC"},
+    {"name": "Denver", "base_temp_range": (15, 100), "ticker_prefix": "KXHIGHDEN"},
 ]
 
 
@@ -276,6 +303,393 @@ def generate_weather_scenario(
             ))
 
     return markets, true_temps
+
+
+# =============================================================================
+# REAL OUTCOME DATA LOADING
+# =============================================================================
+
+def load_real_outcomes() -> list[dict]:
+    """
+    Load real settlement data from real_outcomes.json (written by settlement_tracker).
+
+    Returns a list of real outcome scenarios that can replace synthetic scenarios
+    in backtesting. Each entry contains the data needed to reconstruct a
+    SimulatedMarket + true_temps pair from actual trading results.
+
+    Returns empty list if file doesn't exist, is empty, or has no weather outcomes.
+    """
+    if not REAL_OUTCOMES_FILE.exists():
+        return []
+
+    try:
+        with open(REAL_OUTCOMES_FILE, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+    outcomes = data.get("outcomes", [])
+    if not outcomes:
+        return []
+
+    # Filter to weather trades only (have forecast/actual temp data)
+    weather_outcomes = [
+        o for o in outcomes
+        if o.get("strategy") == "weather"
+        and o.get("forecast_temp") is not None
+        and o.get("actual_temp") is not None
+    ]
+
+    return weather_outcomes
+
+
+def real_outcome_to_scenario(outcome: dict) -> tuple[list[SimulatedMarket], dict]:
+    """
+    Convert a single real outcome record into a (markets, true_temps) pair
+    that the backtest engine can process identically to synthetic scenarios.
+
+    The real outcome gives us one market with known forecast, actual temp,
+    entry price, and settlement result. We reconstruct a minimal scenario
+    around it so detect_edges + settle_trades can evaluate the strategy's
+    decision against what actually happened.
+    """
+    ticker = outcome["ticker"]
+    forecast_temp = outcome["forecast_temp"]
+    actual_temp = outcome["actual_temp"]
+    entry_price = outcome["entry_price"]  # cents
+    side = outcome["side"]  # "yes" or "no"
+    settlement_result = outcome["settlement_result"]  # "yes" or "no"
+
+    # Determine city from ticker prefix
+    city = "NYC"  # default
+    for city_cfg in CITIES:
+        if ticker.startswith(city_cfg["ticker_prefix"]):
+            city = city_cfg["name"]
+            break
+
+    # Determine market type from ticker
+    # Tickers like KXHIGHNY-26MAR21-B57.5 (bucket) or -T63 (threshold)
+    market_type = "bucket"
+    bucket_low = forecast_temp - 0.5
+    bucket_high = forecast_temp + 0.5
+    threshold = 0.0
+
+    if "-B" in ticker:
+        # Bucket market: extract center from ticker
+        try:
+            center = float(ticker.split("-B")[-1])
+            bucket_low = math.floor(center)
+            bucket_high = math.ceil(center)
+            if bucket_low == bucket_high:
+                bucket_high = bucket_low + 1
+        except (ValueError, IndexError):
+            pass
+    elif "-LT" in ticker:
+        # Below threshold (check before -T since -LT contains -T)
+        market_type = "below"
+        try:
+            threshold = float(ticker.split("-LT")[-1])
+        except (ValueError, IndexError):
+            threshold = forecast_temp
+        bucket_low = 0.0
+        bucket_high = threshold
+    elif "-T" in ticker:
+        # Threshold (above) market
+        market_type = "above"
+        try:
+            threshold = float(ticker.split("-T")[-1])
+        except (ValueError, IndexError):
+            threshold = forecast_temp
+        bucket_low = threshold
+        bucket_high = 999.0
+
+    # Reconstruct market prices from entry data
+    # If we bought YES at entry_price, the ask was ~entry_price
+    # If we bought NO at entry_price, the bid was ~(100 - entry_price)
+    if side == "yes":
+        yes_ask = entry_price
+        yes_bid = max(1.0, entry_price - 2.0)  # assume ~2c spread
+    else:
+        yes_bid = 100.0 - entry_price
+        yes_ask = min(99.0, (100.0 - entry_price) + 2.0)
+
+    # True probability: derived from actual settlement
+    # (1.0 if YES settled, 0.0 if NO settled)
+    true_prob = 1.0 if settlement_result == "yes" else 0.0
+
+    market = SimulatedMarket(
+        ticker=ticker,
+        title=f"Real outcome: {ticker}",
+        city=city,
+        market_type=market_type,
+        bucket_low=bucket_low,
+        bucket_high=bucket_high,
+        threshold=threshold,
+        yes_bid_cents=round(yes_bid, 1),
+        yes_ask_cents=round(yes_ask, 1),
+        true_probability=true_prob,
+        volume=100,  # real markets have volume
+        days_out=0,  # already settled
+    )
+
+    true_temps = {
+        city: {
+            "forecast": forecast_temp,
+            "true_temp": actual_temp,
+            "days_out": 0,
+        }
+    }
+
+    return [market], true_temps
+
+
+# =============================================================================
+# KALSHI SETTLED MARKET FETCHER
+# =============================================================================
+
+KALSHI_SERIES = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLA", "KXHIGHDC", "KXHIGHDEN"]
+
+KALSHI_CACHE_TTL_SECONDS = 4 * 3600  # 4 hours
+
+
+def _load_kalshi_cache() -> list | None:
+    """Load cached Kalshi settlements if cache exists and is fresh (< 4 hours old)."""
+    if not KALSHI_CACHE_FILE.exists():
+        return None
+    try:
+        age = time.time() - KALSHI_CACHE_FILE.stat().st_mtime
+        if age > KALSHI_CACHE_TTL_SECONDS:
+            return None
+        with open(KALSHI_CACHE_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError, OSError):
+        return None
+
+
+def _save_kalshi_cache(data: list):
+    """Write settlements list to cache file."""
+    try:
+        with open(KALSHI_CACHE_FILE, "w") as f:
+            json.dump(data, f)
+    except (IOError, OSError):
+        pass
+
+
+def fetch_recent_kalshi_settlements() -> list[tuple[list, dict]]:
+    """
+    Fetch recently settled Kalshi weather markets and convert them into
+    (markets, true_temps) scenario tuples for backtesting.
+
+    Uses the KalshiClient to pull settled markets for each weather series,
+    then fetches actual high temps from NWS observations to build ground-truth
+    scenarios.
+
+    Results are cached to kalshi_cache.json for 4 hours to avoid repeated
+    API calls.
+
+    Returns:
+        List of (markets, true_temps) tuples, one per settled market.
+        Returns empty list on any failure.
+    """
+    try:
+        # Check cache first
+        cached = _load_kalshi_cache()
+        if cached is not None:
+            # Reconstruct scenario tuples from cached dicts
+            scenarios = []
+            for entry in cached:
+                try:
+                    market = SimulatedMarket(**entry["market"])
+                    true_temps = entry["true_temps"]
+                    scenarios.append(([market], true_temps))
+                except (KeyError, TypeError):
+                    continue
+            if scenarios:
+                console.print(
+                    f"[dim]Loaded {len(scenarios)} settled Kalshi scenarios from cache[/dim]"
+                )
+                return scenarios
+
+        # Need KalshiClient and settlement_tracker functions
+        if KalshiClient is None or fetch_actual_high_temp is None:
+            return []
+
+        client = KalshiClient()
+        raw_settlements = []
+
+        for series in KALSHI_SERIES:
+            try:
+                resp = client.get_markets(
+                    series_ticker=series, status="settled", limit=100
+                )
+                markets_data = resp.get("markets", [])
+                for m in markets_data:
+                    ticker = m.get("ticker", "")
+                    title = m.get("title", "")
+                    result = m.get("result", "")
+                    if result not in ("yes", "no"):
+                        continue
+
+                    # Extract prices — Kalshi API returns dollars, convert to cents
+                    yes_bid = float(m.get("yes_bid_dollars", 0) or 0) * 100
+                    yes_ask = float(m.get("yes_ask_dollars", 0) or 0) * 100
+                    # For settled markets, prices may be 0/100; use last_price as fallback
+                    last_price = float(m.get("last_price", 0) or 0) * 100
+                    if yes_bid <= 0 and yes_ask <= 0 and last_price > 0:
+                        yes_bid = max(1.0, last_price - 2.0)
+                        yes_ask = min(99.0, last_price + 2.0)
+                    if yes_ask <= 0:
+                        yes_ask = max(1.0, yes_bid + 2.0)
+                    if yes_bid <= 0:
+                        yes_bid = max(1.0, yes_ask - 2.0)
+
+                    raw_settlements.append({
+                        "ticker": ticker,
+                        "title": title,
+                        "result": result,
+                        "series": series,
+                        "yes_bid": round(yes_bid, 1),
+                        "yes_ask": round(yes_ask, 1),
+                        "close_time": m.get("close_time", ""),
+                    })
+            except Exception:
+                continue  # skip series on API error
+
+        if not raw_settlements:
+            return []
+
+        # Build scenarios from settled markets + actual temps
+        cache_entries = []
+        scenarios = []
+
+        for raw in raw_settlements:
+            ticker = raw["ticker"]
+            title = raw["title"]
+            result = raw["result"]
+            series = raw["series"]
+            yes_bid = raw["yes_bid"]
+            yes_ask = raw["yes_ask"]
+            close_time_str = raw["close_time"]
+
+            # Determine city
+            city = SERIES_TO_CITY.get(series, "NYC")
+
+            # Extract settlement date from close_time for NWS lookup
+            date_str = None
+            if close_time_str:
+                try:
+                    ct = datetime.fromisoformat(
+                        close_time_str.replace("Z", "+00:00")
+                    )
+                    date_str = ct.strftime("%Y-%m-%d")
+                except (ValueError, TypeError):
+                    pass
+
+            # Fetch actual high temp from NWS observations
+            actual_temp = None
+            station_id = NWS_OBSERVATION_STATIONS.get(series)
+            if station_id and date_str:
+                actual_temp = fetch_actual_high_temp(station_id, date_str)
+                time.sleep(0.3)  # rate-limit NWS requests
+
+            if actual_temp is None:
+                continue  # can't build scenario without actual temp
+
+            # Parse market type from ticker/title (reuse logic from real_outcome_to_scenario)
+            market_type = "bucket"
+            bucket_low = actual_temp - 0.5
+            bucket_high = actual_temp + 0.5
+            threshold = 0.0
+
+            if "-B" in ticker:
+                try:
+                    center = float(ticker.split("-B")[-1])
+                    bucket_low = math.floor(center)
+                    bucket_high = math.ceil(center)
+                    if bucket_low == bucket_high:
+                        bucket_high = bucket_low + 1
+                except (ValueError, IndexError):
+                    pass
+            elif "-LT" in ticker:
+                market_type = "below"
+                try:
+                    threshold = float(ticker.split("-LT")[-1])
+                except (ValueError, IndexError):
+                    threshold = actual_temp
+                bucket_low = 0.0
+                bucket_high = threshold
+            elif "-T" in ticker:
+                market_type = "above"
+                try:
+                    threshold = float(ticker.split("-T")[-1])
+                except (ValueError, IndexError):
+                    threshold = actual_temp
+                bucket_low = threshold
+                bucket_high = 999.0
+
+            # True probability: 1.0 if YES settled, 0.0 if NO settled
+            true_prob = 1.0 if result == "yes" else 0.0
+
+            market = SimulatedMarket(
+                ticker=ticker,
+                title=title,
+                city=city,
+                market_type=market_type,
+                bucket_low=bucket_low,
+                bucket_high=bucket_high,
+                threshold=threshold,
+                yes_bid_cents=yes_bid,
+                yes_ask_cents=yes_ask,
+                true_probability=true_prob,
+                volume=100,
+                days_out=0,
+            )
+
+            # Use actual_temp as both forecast and true_temp — for settled markets
+            # the forecast error is already baked into the result
+            true_temps = {
+                city: {
+                    "forecast": actual_temp,
+                    "true_temp": actual_temp,
+                    "days_out": 0,
+                }
+            }
+
+            scenarios.append(([market], true_temps))
+            cache_entries.append({
+                "market": {
+                    "ticker": market.ticker,
+                    "title": market.title,
+                    "city": market.city,
+                    "market_type": market.market_type,
+                    "bucket_low": market.bucket_low,
+                    "bucket_high": market.bucket_high,
+                    "threshold": market.threshold,
+                    "yes_bid_cents": market.yes_bid_cents,
+                    "yes_ask_cents": market.yes_ask_cents,
+                    "true_probability": market.true_probability,
+                    "volume": market.volume,
+                    "days_out": market.days_out,
+                },
+                "true_temps": true_temps,
+            })
+
+        # Cache results
+        if cache_entries:
+            _save_kalshi_cache(cache_entries)
+
+        if scenarios:
+            console.print(
+                f"[green]Fetched {len(scenarios)} settled Kalshi weather scenarios[/green]"
+            )
+
+        return scenarios
+
+    except Exception as e:
+        console.print(
+            f"[yellow]Kalshi settlement fetch failed ({e}), using synthetic only[/yellow]"
+        )
+        return []
 
 
 # =============================================================================
@@ -600,7 +1014,11 @@ def score_simulation(
 # FULL BACKTEST: MANY SCENARIOS
 # =============================================================================
 
-def run_weather_backtest(seed: int = 42, n_scenarios: int = 200) -> dict:
+def run_weather_backtest(
+    seed: int = 42,
+    n_scenarios: int = 200,
+    use_real_data: bool = False,
+) -> dict:
     """
     Run a full weather strategy backtest:
     1. Load candidate_strategy params
@@ -608,6 +1026,11 @@ def run_weather_backtest(seed: int = 42, n_scenarios: int = 200) -> dict:
     3. Detect edges and scale positions relative to current balance
     4. Settle trades, accumulate P&L
     5. Score the result
+
+    If use_real_data=True and real_outcomes.json exists, the FIRST N scenarios
+    (where N = number of real outcomes) use real settlement data. The remaining
+    scenarios are filled with synthetic data. This ensures the strategy is
+    optimized against real market behavior first, then explored with simulation.
 
     Returns dict with all metrics.
     """
@@ -622,11 +1045,31 @@ def run_weather_backtest(seed: int = 42, n_scenarios: int = 200) -> dict:
     all_results = []
     balance = initial_balance
 
-    for _ in range(n_scenarios):
+    # Load real outcomes if requested
+    real_scenarios = []
+    if use_real_data:
+        real_outcomes = load_real_outcomes()
+        if real_outcomes:
+            for outcome in real_outcomes:
+                try:
+                    markets, true_temps = real_outcome_to_scenario(outcome)
+                    real_scenarios.append((markets, true_temps))
+                except Exception:
+                    continue  # skip malformed entries
+
+    n_real = len(real_scenarios)
+    n_synthetic = max(0, n_scenarios - n_real)
+
+    for scenario_idx in range(n_real + n_synthetic):
         if balance <= 1.0:
             break  # Account blown
 
-        markets, true_temps = generate_weather_scenario(rng)
+        # Use real scenario data first, then synthetic
+        if scenario_idx < n_real:
+            markets, true_temps = real_scenarios[scenario_idx]
+        else:
+            markets, true_temps = generate_weather_scenario(rng)
+
         edges = detect_edges(markets, true_temps, params)
 
         # Sort edges by edge size (best first) and apply daily budget
@@ -790,6 +1233,7 @@ def run_research(
     max_iterations: int = None,
     n_scenarios: int = 200,
     verbose: bool = True,
+    use_real_data: bool = False,
 ):
     """
     Run the Weather AutoResearch loop.
@@ -806,6 +1250,8 @@ def run_research(
         max_iterations: Number of experiments to run
         n_scenarios: Number of weather days to simulate per backtest
         verbose: Print progress to terminal
+        use_real_data: If True, incorporate real settlement outcomes from
+                       real_outcomes.json for the first N scenarios
     """
     max_iterations = max_iterations or config.AUTORESEARCH_MAX_ITERATIONS
 
@@ -813,9 +1259,25 @@ def run_research(
     console.print("[bold cyan]  WEATHER AUTORESEARCH: Forecast Arbitrage Optimization Loop  [/bold cyan]")
     console.print("[bold cyan]================================================================[/bold cyan]\n")
 
+    # Report real data status
+    if use_real_data:
+        real_outcomes = load_real_outcomes()
+        if real_outcomes:
+            console.print(
+                f"[green]Real data mode: {len(real_outcomes)} real outcomes loaded "
+                f"from {REAL_OUTCOMES_FILE.name}[/green]"
+            )
+        else:
+            console.print(
+                "[yellow]Real data mode requested but no weather outcomes found -- "
+                "falling back to 100% synthetic[/yellow]"
+            )
+
     # Baseline: score current strategy
     console.print("[dim]Running baseline weather backtest...[/dim]")
-    baseline = run_weather_backtest(seed=42, n_scenarios=n_scenarios)
+    baseline = run_weather_backtest(
+        seed=42, n_scenarios=n_scenarios, use_real_data=use_real_data
+    )
     if "error" in baseline:
         console.print(f"[red]Baseline failed: {baseline['error']}[/red]")
         return
@@ -869,7 +1331,9 @@ def run_research(
             write_strategy_file(new_source)
 
             # Run weather backtest with slightly different seed per iteration
-            metrics = run_weather_backtest(seed=42 + i, n_scenarios=n_scenarios)
+            metrics = run_weather_backtest(
+                seed=42 + i, n_scenarios=n_scenarios, use_real_data=use_real_data
+            )
             if "error" in metrics:
                 write_strategy_file(source)  # revert on error
                 progress.update(task, advance=1)
@@ -887,6 +1351,11 @@ def run_research(
                     f"WeatherResearch iter {i}: {param}={new_val} "
                     f"score={new_score:.4f} sortino={metrics['sortino']:.3f}"
                 )
+                if alert_research_improvement is not None:
+                    try:
+                        alert_research_improvement(param, old_val, new_val, new_score)
+                    except Exception:
+                        pass
                 if verbose:
                     console.print(
                         f"  [green]+ Iter {i}: {param} {old_val}->{new_val} "
@@ -922,7 +1391,9 @@ def run_research(
     console.print(f"  Improvements found: {improvements}")
     console.print(f"  Best score: {best_score:.4f} (baseline was {baseline['score']:.4f})")
 
-    final = run_weather_backtest(seed=42, n_scenarios=n_scenarios)
+    final = run_weather_backtest(
+        seed=42, n_scenarios=n_scenarios, use_real_data=use_real_data
+    )
     if "error" in final:
         console.print(f"[red]Final backtest failed: {final['error']}[/red]")
     else:
@@ -960,10 +1431,16 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", type=int, default=50, help="Number of experiments")
     parser.add_argument("--scenarios", type=int, default=200, help="Weather days per backtest")
     parser.add_argument("--quiet", action="store_true", help="Less output")
+    parser.add_argument("--no-claude", action="store_true", help="Random mutations only (no Claude API)")
+    parser.add_argument(
+        "--use-real-data", action="store_true",
+        help="Incorporate real settlement outcomes from real_outcomes.json"
+    )
     args = parser.parse_args()
 
     run_research(
         max_iterations=args.iterations,
         n_scenarios=args.scenarios,
         verbose=not args.quiet,
+        use_real_data=args.use_real_data,
     )

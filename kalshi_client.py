@@ -39,38 +39,52 @@ class KalshiClient:
             return serialization.load_pem_private_key(f.read(), password=None)
 
     def _sign_request(self, method: str, path: str, timestamp_ms: int) -> str:
-        """Create RSA signature for API authentication."""
-        # Kalshi v2 signature: timestamp + method + path
+        """Create RSA-PSS signature for API authentication (official Kalshi method)."""
         message = f"{timestamp_ms}{method}{path}"
         signature = self.private_key.sign(
             message.encode("utf-8"),
-            padding.PKCS1v15(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
             hashes.SHA256(),
         )
         return base64.b64encode(signature).decode("utf-8")
 
     def _request(self, method: str, path: str, params: dict = None, data: dict = None):
-        """Make authenticated request to Kalshi API."""
-        url = f"{self.base_url}{path}"
-        timestamp_ms = int(time.time() * 1000)
-        signature = self._sign_request(method.upper(), path, timestamp_ms)
+        """Make authenticated request to Kalshi API with auto-retry on connection errors."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                url = f"{self.base_url}{path}"
+                timestamp_ms = int(time.time() * 1000)
+                full_path = f"/trade-api/v2{path}"
+                signature = self._sign_request(method.upper(), full_path, timestamp_ms)
 
-        headers = {
-            "KALSHI-ACCESS-KEY": self.api_key_id,
-            "KALSHI-ACCESS-SIGNATURE": signature,
-            "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
-        }
+                headers = {
+                    "KALSHI-ACCESS-KEY": self.api_key_id,
+                    "KALSHI-ACCESS-SIGNATURE": signature,
+                    "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
+                }
 
-        resp = self.session.request(
-            method=method,
-            url=url,
-            headers=headers,
-            params=params,
-            json=data,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()
+                resp = self.session.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=data,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError) as e:
+                if attempt < max_retries - 1:
+                    # Reset the session to clear stale SSL state (fixes post-sleep errors)
+                    self.session = requests.Session()
+                    self.session.headers.update({"Content-Type": "application/json"})
+                    time.sleep(2 ** attempt)  # 1s, 2s backoff
+                else:
+                    raise
 
     # =========================================================================
     # MARKET DATA
@@ -177,9 +191,11 @@ class KalshiClient:
             params["status"] = status
         return self._request("GET", "/portfolio/orders", params=params)
 
-    def get_fills(self, ticker: str = None, limit: int = 100) -> dict:
+    def get_fills(self, ticker: str = None, limit: int = 100, cursor: str = None) -> dict:
         """Get fill history."""
         params = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
         return self._request("GET", "/portfolio/fills", params=params)

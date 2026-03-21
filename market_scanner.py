@@ -30,12 +30,22 @@ class MarketScanner:
         """
         all_markets = []
 
+        # First do a broad scan (no series filter) to catch all active markets
+        try:
+            markets = self._scan_series(None)
+            all_markets.extend(markets)
+        except Exception as e:
+            console.print(f"  [yellow]Warning: Broad scan failed: {e}[/yellow]")
+
+        # Also scan specific target series
         for series in config.TARGET_MARKET_SERIES:
             try:
                 markets = self._scan_series(series)
-                all_markets.extend(markets)
+                # Deduplicate by ticker
+                existing = {m["ticker"] for m in all_markets}
+                all_markets.extend(m for m in markets if m["ticker"] not in existing)
             except Exception as e:
-                console.print(f"  [yellow]Warning: Could not scan {series}: {e}[/yellow]")
+                pass  # Series may not exist on demo
 
         if not all_markets:
             console.print("[red]No markets found. Check your API keys and connection.[/red]")
@@ -44,26 +54,33 @@ class MarketScanner:
         df = pd.DataFrame(all_markets)
 
         # Filter by volume and time to settlement
-        if "volume" in df.columns:
-            df = df[df["volume"] >= config.MIN_MARKET_VOLUME]
+        # Filter by minimum volume (lowered for demo mode)
+        min_vol = 0 if config.KALSHI_ENV == "DEMO" else max(1, config.MIN_MARKET_VOLUME // 10)
+        if "volume" in df.columns and min_vol > 0:
+            df = df[df["volume"] >= min_vol]
         if "hours_to_settlement" in df.columns:
             df = df[df["hours_to_settlement"] <= config.MAX_HOURS_TO_SETTLEMENT]
 
         df = df.sort_values("volume", ascending=False).reset_index(drop=True)
         return df
 
-    def _scan_series(self, series_ticker: str) -> list[dict]:
-        """Scan a single series for open markets."""
+    def _scan_series(self, series_ticker: str = None) -> list[dict]:
+        """Scan markets, optionally filtered by series. Pass None for broad scan."""
         markets = []
         cursor = None
+        max_pages = 5  # Limit pages to avoid rate limits
 
-        while True:
-            resp = self.client.get_markets(
-                series_ticker=series_ticker,
-                status="open",
-                limit=100,
-                cursor=cursor,
-            )
+        for _ in range(max_pages):
+            try:
+                resp = self.client.get_markets(
+                    series_ticker=series_ticker,
+                    status="open",
+                    limit=100,
+                    cursor=cursor,
+                )
+            except Exception:
+                break
+
             for m in resp.get("markets", []):
                 parsed = self._parse_market(m)
                 if parsed:
@@ -72,7 +89,7 @@ class MarketScanner:
             cursor = resp.get("cursor")
             if not cursor:
                 break
-            time.sleep(0.2)  # Rate limiting
+            time.sleep(1.0)  # Rate limiting — Kalshi enforces strict limits
 
         return markets
 
@@ -89,14 +106,37 @@ class MarketScanner:
             if hours_to_settlement < 0.5:
                 return None
 
-            yes_price = raw.get("yes_bid", 0) or 0
-            no_price = raw.get("no_bid", 0) or 0
-            yes_ask = raw.get("yes_ask", 0) or 0
-            last_price = raw.get("last_price", 0) or 0
-            volume = raw.get("volume", 0) or 0
+            # API v2 returns prices as dollar strings (e.g., "0.5000")
+            # Convert to cents (integer 0-99) for internal use
+            def to_cents(val):
+                if val is None:
+                    return 0
+                try:
+                    return int(float(val) * 100)
+                except (ValueError, TypeError):
+                    return 0
 
-            # Calculate spread
+            yes_price = to_cents(raw.get("yes_bid_dollars") or raw.get("yes_bid") or 0)
+            no_price = to_cents(raw.get("no_bid_dollars") or raw.get("no_bid") or 0)
+            yes_ask = to_cents(raw.get("yes_ask_dollars") or raw.get("yes_ask") or 0)
+            last_price = to_cents(raw.get("last_price_dollars") or raw.get("last_price") or 0)
+
+            # Volume: try float string first, then int
+            vol_raw = raw.get("volume_fp") or raw.get("volume_24h_fp") or raw.get("volume") or 0
+            try:
+                volume = int(float(vol_raw))
+            except (ValueError, TypeError):
+                volume = 0
+
+            # Calculate spread in cents
             spread = (yes_ask - yes_price) if (yes_ask and yes_price) else 99
+
+            # Open interest
+            oi_raw = raw.get("open_interest_fp") or raw.get("open_interest") or 0
+            try:
+                open_interest = int(float(oi_raw))
+            except (ValueError, TypeError):
+                open_interest = 0
 
             return {
                 "ticker": raw.get("ticker", ""),
@@ -109,7 +149,7 @@ class MarketScanner:
                 "last_price": last_price,
                 "spread": spread,
                 "volume": volume,
-                "open_interest": raw.get("open_interest", 0) or 0,
+                "open_interest": open_interest,
                 "hours_to_settlement": round(hours_to_settlement, 1),
                 "close_time": close_time.isoformat(),
                 "result": raw.get("result", ""),
@@ -136,23 +176,24 @@ class MarketScanner:
             console.print("[red]No markets to display.[/red]")
             return
 
-        table = Table(title="Active High-Volume Markets", show_lines=True)
-        table.add_column("Ticker", style="cyan", width=25)
-        table.add_column("Title", style="white", width=40)
-        table.add_column("Yes$", justify="right", style="green")
-        table.add_column("Spread", justify="right")
-        table.add_column("Vol", justify="right", style="yellow")
-        table.add_column("Hrs", justify="right", style="magenta")
+        table = Table(title="Active High-Volume Markets", show_lines=False, padding=(0, 1))
+        table.add_column("Ticker", style="cyan", max_width=35, no_wrap=True)
+        table.add_column("Title", style="white", max_width=45)
+        table.add_column("Yes", justify="right", style="green", min_width=5)
+        table.add_column("Sprd", justify="right", min_width=5)
+        table.add_column("Volume", justify="right", style="yellow", min_width=7)
+        table.add_column("Hrs", justify="right", style="magenta", min_width=5)
 
         for _, row in df.head(top_n).iterrows():
             spread_color = "green" if row["spread"] <= 5 else "yellow" if row["spread"] <= 10 else "red"
+            vol_str = f"{row['volume']:,}" if row['volume'] > 0 else "-"
             table.add_row(
-                str(row["ticker"]),
-                str(row["title"]),
+                str(row["ticker"])[:35],
+                str(row["title"])[:45],
                 f"{row['yes_price']}c",
                 f"[{spread_color}]{row['spread']}c[/{spread_color}]",
-                str(row["volume"]),
-                str(row["hours_to_settlement"]),
+                vol_str,
+                f"{row['hours_to_settlement']:.0f}",
             )
 
         console.print(table)

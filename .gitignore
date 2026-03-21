@@ -3,7 +3,9 @@
 __pycache__/
 *.pyc
 .venv/
-output/*.html
-output/*.png
-output/*.csv
+output/
 autoresearch/results.log
+autoresearch/launchd.log
+autoresearch/overnight_*.log
+autoresearch/kalshi_cache.json
+autoresearch/real_outcomes.json
