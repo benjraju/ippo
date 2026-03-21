@@ -223,6 +223,37 @@ def send_daily_recap():
     message = "\n".join(lines)
     _send_telegram(message)
 
+    # --- Send strategy summary as a second message ---
+    try:
+        from strategy_doc import generate_strategy_doc
+        generate_strategy_doc()
+
+        strategy_path = Path(__file__).parent / "STRATEGY.md"
+        if strategy_path.exists():
+            doc = strategy_path.read_text()
+
+            # Extract key sections for Telegram (full doc is too long)
+            sections = doc.split("\n## ")
+            summary_parts = ["<b>STRATEGY SUMMARY</b>\n"]
+
+            for section in sections:
+                title = section.split("\n")[0].strip()
+                if title in ("How Ippo Makes Money", "Current Strategy Settings",
+                             "What AutoResearch Has Learned"):
+                    # Trim to first 600 chars of each section
+                    content = "\n".join(section.split("\n")[1:]).strip()
+                    if len(content) > 600:
+                        content = content[:597] + "..."
+                    summary_parts.append(f"<b>{title}</b>\n{content}\n")
+
+            strategy_msg = "\n".join(summary_parts)
+            # Telegram has 4096 char limit
+            if len(strategy_msg) > 4000:
+                strategy_msg = strategy_msg[:3997] + "..."
+            _send_telegram(strategy_msg)
+    except Exception:
+        pass  # Non-critical
+
 
 if __name__ == "__main__":
     send_daily_recap()
