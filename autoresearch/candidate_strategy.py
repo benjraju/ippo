@@ -25,7 +25,7 @@ FORECAST_STDEV_3 = 4.5   # 3 days out
 EDGE_THRESHOLD_CENTS = 3.0
 
 # Position sizing: number of contracts per trade
-CONTRACTS_PER_TRADE = 10
+CONTRACTS_PER_TRADE = 8
 
 # NWS blend ratio: weight given to NWS official forecast vs. ensemble mean.
 # 0.0 = pure ensemble, 1.0 = pure NWS official. Currently 40% NWS, 60% ensemble.
