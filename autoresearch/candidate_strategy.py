@@ -35,7 +35,7 @@ NWS_OFFICIAL_WEIGHT = 0.40
 # Higher weight = trade more contracts in that city.
 CITY_WEIGHT_NYC = 1.0
 CITY_WEIGHT_CHI = 1.0
-CITY_WEIGHT_MIA = 1.5
+CITY_WEIGHT_MIA = 1.0
 CITY_WEIGHT_LA = 1.0
 
 # Market type preference: multiplier on contracts for bucket vs threshold markets.
