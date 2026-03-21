@@ -22,7 +22,7 @@ FORECAST_STDEV_3 = 4.5   # 3 days out
 
 # Edge threshold: minimum edge in cents before we place a trade.
 # Too low = many low-quality trades with slippage. Too high = miss good edges.
-EDGE_THRESHOLD_CENTS = 3.0
+EDGE_THRESHOLD_CENTS = 7.0
 
 # Position sizing: number of contracts per trade
 CONTRACTS_PER_TRADE = 8
