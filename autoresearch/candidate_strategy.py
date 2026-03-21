@@ -38,7 +38,7 @@ MAX_HOURS = 24
 
 # Mean-reversion parameters
 MEAN_REVERT_THRESHOLD_HIGH = 0.85  # Above this, bet on reversion
-MEAN_REVERT_THRESHOLD_LOW = 0.15   # Below this, bet on reversion
+MEAN_REVERT_THRESHOLD_LOW = 0.13  # Below this, bet on reversion
 MEAN_REVERT_STRENGTH = 0.06  # How much to adjust probability
 
 # Volume-weighted confidence adjustment
