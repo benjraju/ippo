@@ -37,6 +37,8 @@ CITY_WEIGHT_NYC = 1.0
 CITY_WEIGHT_CHI = 0.8
 CITY_WEIGHT_MIA = 1.0
 CITY_WEIGHT_LA = 1.0
+CITY_WEIGHT_DC = 1.0
+CITY_WEIGHT_DEN = 1.0
 
 # Market type preference: multiplier on contracts for bucket vs threshold markets.
 # >1.0 = prefer that type, <1.0 = trade less of that type.
@@ -59,6 +61,35 @@ TIGHT_ENSEMBLE_THRESHOLD = 2.0
 TIGHT_ENSEMBLE_MULTIPLIER = 1.5
 
 
+# =============================================================================
+# COPY-TRADE PARAMETERS -- AutoResearch will modify these
+# =============================================================================
+
+# Minimum confidence to auto-copy a trade (0.0-1.0)
+COPY_MIN_CONFIDENCE = 0.8
+
+# How quickly to react after detecting a whale trade (seconds)
+# Lower = more aggressive, higher = wait for confirmation
+COPY_DELAY_SECONDS = 60
+
+# Position sizing as fraction of what the whale trades
+COPY_SIZE_FRACTION = 0.01  # 1% of whale's position
+
+# Maximum copy trades per day
+COPY_MAX_TRADES_PER_DAY = 10
+
+# Minimum whale trade size to copy (USD)
+COPY_MIN_WHALE_SIZE = 100.0
+
+# Weight per tracked trader (how much to trust their signals)
+COPY_TRADER_WEIGHT_0x8dxd = 1.0
+
+# Which categories to copy (multiplier: 0 = skip, 1 = normal, 2 = double)
+COPY_CRYPTO_MULT = 1.5
+COPY_POLITICS_MULT = 0.0  # Don't copy politics initially
+COPY_SPORTS_MULT = 0.5
+
+
 def get_forecast_stdev():
     """Return the FORECAST_STDEV dict used by weather_strategy.py."""
     return {
@@ -76,6 +107,8 @@ def get_city_weights():
         "Chicago": CITY_WEIGHT_CHI,
         "Miami": CITY_WEIGHT_MIA,
         "LA": CITY_WEIGHT_LA,
+        "DC": CITY_WEIGHT_DC,
+        "Denver": CITY_WEIGHT_DEN,
     }
 
 
@@ -93,6 +126,8 @@ def get_strategy_params():
         "city_weight_chi": CITY_WEIGHT_CHI,
         "city_weight_mia": CITY_WEIGHT_MIA,
         "city_weight_la": CITY_WEIGHT_LA,
+        "city_weight_dc": CITY_WEIGHT_DC,
+        "city_weight_den": CITY_WEIGHT_DEN,
         "bucket_multiplier": BUCKET_MULTIPLIER,
         "threshold_multiplier": THRESHOLD_MULTIPLIER,
         "high_confidence_edge": HIGH_CONFIDENCE_EDGE,
@@ -101,4 +136,14 @@ def get_strategy_params():
         "min_volume": MIN_VOLUME,
         "tight_ensemble_threshold": TIGHT_ENSEMBLE_THRESHOLD,
         "tight_ensemble_multiplier": TIGHT_ENSEMBLE_MULTIPLIER,
+        # Copy-trade parameters
+        "copy_min_confidence": COPY_MIN_CONFIDENCE,
+        "copy_delay_seconds": COPY_DELAY_SECONDS,
+        "copy_size_fraction": COPY_SIZE_FRACTION,
+        "copy_max_trades_per_day": COPY_MAX_TRADES_PER_DAY,
+        "copy_min_whale_size": COPY_MIN_WHALE_SIZE,
+        "copy_trader_weight_0x8dxd": COPY_TRADER_WEIGHT_0x8dxd,
+        "copy_crypto_mult": COPY_CRYPTO_MULT,
+        "copy_politics_mult": COPY_POLITICS_MULT,
+        "copy_sports_mult": COPY_SPORTS_MULT,
     }
