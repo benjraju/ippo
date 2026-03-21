@@ -1057,16 +1057,23 @@ def run_weather_backtest(
                 except Exception:
                     continue  # skip malformed entries
 
-    n_real = len(real_scenarios)
+    # Fetch settled Kalshi markets (always attempted — cached for 4 hours)
+    kalshi_scenarios = fetch_recent_kalshi_settlements()
+    # Weight real Kalshi scenarios 3x since they represent actual market behavior
+    weighted_kalshi = kalshi_scenarios * 3
+
+    # Build combined scenario list: real outcomes first, then Kalshi 3x, then synthetic
+    all_real = real_scenarios + weighted_kalshi
+    n_real = len(all_real)
     n_synthetic = max(0, n_scenarios - n_real)
 
     for scenario_idx in range(n_real + n_synthetic):
         if balance <= 1.0:
             break  # Account blown
 
-        # Use real scenario data first, then synthetic
+        # Use real/Kalshi scenario data first, then synthetic
         if scenario_idx < n_real:
-            markets, true_temps = real_scenarios[scenario_idx]
+            markets, true_temps = all_real[scenario_idx]
         else:
             markets, true_temps = generate_weather_scenario(rng)
 
@@ -1273,6 +1280,18 @@ def run_research(
                 "falling back to 100% synthetic[/yellow]"
             )
 
+    # Report Kalshi settled data status (always fetched, independent of --use-real-data)
+    kalshi_preview = fetch_recent_kalshi_settlements()
+    if kalshi_preview:
+        console.print(
+            f"[green]Kalshi settled markets: {len(kalshi_preview)} scenarios "
+            f"(weighted 3x = {len(kalshi_preview) * 3} effective scenarios)[/green]"
+        )
+    else:
+        console.print(
+            "[dim]No settled Kalshi weather markets available -- using synthetic only[/dim]"
+        )
+
     # Baseline: score current strategy
     console.print("[dim]Running baseline weather backtest...[/dim]")
     baseline = run_weather_backtest(
@@ -1419,6 +1438,14 @@ def run_research(
         console.print(f"  BUCKET_MULT: {params['bucket_multiplier']} / THRESHOLD_MULT: {params['threshold_multiplier']}")
 
     console.print(f"[bold cyan]{'=' * 65}[/bold cyan]\n")
+
+    # Regenerate strategy doc after each research cycle
+    try:
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from strategy_doc import generate_strategy_doc
+        generate_strategy_doc()
+    except Exception:
+        pass  # Non-critical
 
 
 # =============================================================================
