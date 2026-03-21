@@ -1,0 +1,9 @@
+.env
+*.pem
+__pycache__/
+*.pyc
+.venv/
+output/*.html
+output/*.png
+output/*.csv
+autoresearch/results.log

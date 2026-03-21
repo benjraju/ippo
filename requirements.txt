@@ -1,0 +1,29 @@
+# Core trading
+requests>=2.31.0
+websockets>=12.0
+pandas>=2.1.0
+numpy>=1.26.0
+
+# Kalshi client
+cryptography>=41.0.0
+PyJWT>=2.8.0
+
+# Charts and visualization
+plotly>=5.18.0
+kaleido>=0.2.1
+
+# Claude AI agent
+anthropic>=0.39.0
+
+# Environment and CLI
+python-dotenv>=1.0.0
+click>=8.1.0
+rich>=13.7.0
+tabulate>=0.9.0
+
+# Scheduling
+schedule>=1.2.0
+
+# MLX for Apple Silicon (AutoResearch)
+mlx>=0.5.0
+mlx-lm>=0.5.0
