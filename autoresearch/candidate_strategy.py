@@ -34,7 +34,7 @@ MAX_POSITION_FRAC = 0.02
 MIN_VOLUME = 50
 
 # Market selection: maximum hours to settlement
-MAX_HOURS = 48
+MAX_HOURS = 24
 
 # Mean-reversion parameters
 MEAN_REVERT_THRESHOLD_HIGH = 0.85  # Above this, bet on reversion
