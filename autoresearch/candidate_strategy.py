@@ -25,7 +25,7 @@ import numpy as np
 MIN_EDGE = 0.06
 
 # Kelly fraction multiplier (0.25 = quarter Kelly)
-KELLY_MULT = 0.25
+KELLY_MULT = 0.1
 
 # Maximum position as fraction of account
 MAX_POSITION_FRAC = 0.015
