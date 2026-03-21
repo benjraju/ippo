@@ -90,6 +90,52 @@ COPY_POLITICS_MULT = 0.0  # Don't copy politics initially
 COPY_SPORTS_MULT = 0.5
 
 
+# =============================================================================
+# CRYPTO PARAMETERS -- AutoResearch will modify these
+# =============================================================================
+
+# Minimum edge in cents to flag a crypto range market (4¢ = 4 percentage points)
+CRYPTO_MIN_EDGE_CENTS = 4.0
+
+# Position sizing for crypto trades
+CRYPTO_CONTRACTS_PER_TRADE = 5
+CRYPTO_MAX_POSITION_DOLLARS = 5.0
+
+# Volatility bias: multiplicative adjustment to realized vol before computing fair value.
+# >1.0 = assume more vol than measured (conservative, fewer center-bucket bets).
+# <1.0 = assume less vol than measured (aggressive, more center-bucket bets).
+CRYPTO_VOL_BIAS_BTC = 1.0  # Bitcoin vol adjustment
+CRYPTO_VOL_BIAS_ETH = 1.0  # Ethereum vol adjustment
+CRYPTO_VOL_BIAS_SOL = 1.0  # Solana vol adjustment
+
+# Bucket bias corrections:
+# Center bias < 1.0 discounts YES fair value for center buckets (retail overprices center).
+# Tail multiplier > 1.0 boosts YES fair value for tail buckets (retail underprices tails).
+CRYPTO_CENTER_BUCKET_BIAS = 0.95   # scale fair_yes for buckets within 1 sigma
+CRYPTO_TAIL_BUCKET_MULTIPLIER = 1.0  # scale fair_yes for buckets beyond 1 sigma
+
+
+# =============================================================================
+# SPORTS PARAMETERS -- AutoResearch will modify these
+# =============================================================================
+
+# Home court advantage in NBA (points added to home team's adjusted differential)
+SPORTS_HOME_COURT_ADVANTAGE = 3.2
+
+# Standard deviation of NBA game margin (calibrates logistic win probability)
+SPORTS_NBA_GAME_STDEV = 11.5
+
+# Weight for recent form (last 10 games) vs season-long stats
+SPORTS_RECENT_FORM_WEIGHT = 0.30
+
+# Minimum edge (percentage points) to flag a sports market
+SPORTS_MIN_EDGE_PCT = 5.0
+
+# Position sizing for sports trades
+SPORTS_CONTRACTS_PER_TRADE = 5
+SPORTS_MAX_POSITION_DOLLARS = 5.0
+
+
 def get_forecast_stdev():
     """Return the FORECAST_STDEV dict used by weather_strategy.py."""
     return {

@@ -1,0 +1,19 @@
+[Unit]
+Description=Ippo Hourly Update - Status summary via Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ippo
+ExecStart=/opt/ippo/.venv/bin/python /opt/ippo/hourly_update.py
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=60
+
+MemoryMax=256M
+
+StandardOutput=append:/opt/ippo/output/hourly_update.log
+StandardError=append:/opt/ippo/output/hourly_update.log
+
+[Install]
+WantedBy=default.target

@@ -1887,6 +1887,38 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         f"max_per_trade=${MAX_DOLLARS_PER_TRADE:.2f}"
     )
 
+    # Track today's opening balance for accurate daily drawdown calculation
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _opening_bal_file = config.OUTPUT_DIR / ".daily_opening_balance"
+    opening_balance = balance  # fallback: use current if no file yet
+    if _opening_bal_file.exists():
+        try:
+            stored = _opening_bal_file.read_text().strip()
+            stored_date, stored_bal_str = stored.split(":", 1)
+            if stored_date == today_str:
+                opening_balance = float(stored_bal_str)
+            else:
+                # New day — record today's opening balance
+                _opening_bal_file.write_text(f"{today_str}:{balance:.4f}")
+        except Exception:
+            _opening_bal_file.write_text(f"{today_str}:{balance:.4f}")
+    else:
+        _opening_bal_file.write_text(f"{today_str}:{balance:.4f}")
+
+    daily_dd_pct = (opening_balance - balance) / opening_balance * 100 if opening_balance > 0 else 0.0
+    logger.info(f"Daily drawdown: {daily_dd_pct:.1f}% (opened ${opening_balance:.2f}, now ${balance:.2f})")
+
+    # Enforce 8% daily loss cap — pause trading and alert if breached
+    if daily_dd_pct >= DAILY_LOSS_CAP_PCT * 100 and not dry_run:
+        pause_file.touch()
+        if alert_drawdown:
+            alert_drawdown(daily_dd_pct, balance, opening_balance, is_hard_stop=True)
+        logger.warning(
+            f"Daily loss cap hit ({daily_dd_pct:.1f}% of opening ${opening_balance:.2f}). "
+            f"Trading automatically paused."
+        )
+        return []
+
     all_decisions = []
 
     # --- Exit check (runs before placing new trades) ---
@@ -2019,12 +2051,11 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             if alert_bot_error:
                 alert_bot_error("auto_trade", str(e))
 
-    # --- Drawdown check ---
-    total_risk = sum(d.max_loss_dollars for d in all_decisions if d.placed or (dry_run and d.contracts > 0))
-    if balance > 0:
-        dd_pct = (total_risk / balance) * 100
-        if alert_drawdown and dd_pct >= 5.0:
-            alert_drawdown(dd_pct, balance)
+    # --- Drawdown alert (actual daily loss vs opening balance) ---
+    if opening_balance > 0:
+        daily_dd_pct = (opening_balance - balance) / opening_balance * 100
+        if alert_drawdown and daily_dd_pct >= 5.0:
+            alert_drawdown(daily_dd_pct, balance, opening_balance)
 
     # --- Summary ---
     trades_placed = [d for d in all_decisions if d.placed or (dry_run and d.contracts > 0)]

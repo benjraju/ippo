@@ -261,14 +261,23 @@ def alert_trade_settled(ticker: str, side: str, pnl: float, won: bool):
     _send_macos(f"Trade {'WON' if won else 'LOST'}", f"{sign}${pnl:.2f}", sound=won)
 
 
-def alert_drawdown(current_dd_pct: float, balance: float):
+def alert_drawdown(current_dd_pct: float, balance: float, opening_balance: float = None, is_hard_stop: bool = False):
     _log_to_file("Drawdown Warning", f"{current_dd_pct:.1f}% — ${balance:.2f}")
-    _send_telegram(
-        f"<b>DRAWDOWN WARNING</b>\n\n"
-        f"Account is down {current_dd_pct:.1f}% today\n"
-        f"Balance: ${balance:.2f}\n\n"
-        f"Trading will automatically pause at 8% daily loss."
-    )
+    ref = f" (opened ${opening_balance:.2f})" if opening_balance else ""
+    if is_hard_stop:
+        _send_telegram(
+            f"<b>🛑 DAILY LOSS CAP HIT — TRADING PAUSED</b>\n\n"
+            f"Account is down {current_dd_pct:.1f}% today{ref}\n"
+            f"Balance: ${balance:.2f}\n\n"
+            f"Auto-trading has been paused. Send /resume to restart."
+        )
+    else:
+        _send_telegram(
+            f"<b>DRAWDOWN WARNING</b>\n\n"
+            f"Account is down {current_dd_pct:.1f}% today{ref}\n"
+            f"Balance: ${balance:.2f}\n\n"
+            f"Trading will automatically pause at 8% daily loss."
+        )
 
 
 def alert_bot_error(component: str, error: str):

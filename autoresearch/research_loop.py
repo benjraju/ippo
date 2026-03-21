@@ -104,6 +104,44 @@ MUTATION_SPACE = {
     "TIGHT_ENSEMBLE_MULTIPLIER": [1.0, 1.2, 1.5, 2.0],
 }
 
+# =============================================================================
+# CRYPTO-SPECIFIC MUTATION SPACE
+# =============================================================================
+
+CRYPTO_MUTATION_SPACE = {
+    # Edge threshold in cents
+    "CRYPTO_MIN_EDGE_CENTS": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    # Position sizing
+    "CRYPTO_CONTRACTS_PER_TRADE": [3, 5, 8, 10, 15],
+    "CRYPTO_MAX_POSITION_DOLLARS": [3.0, 5.0, 7.0, 10.0],
+    # Per-asset vol bias: multiplicative scale applied to realized vol
+    # >1.0 = conservative (assumes more vol), <1.0 = aggressive (assumes less vol)
+    "CRYPTO_VOL_BIAS_BTC": [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3],
+    "CRYPTO_VOL_BIAS_ETH": [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3],
+    "CRYPTO_VOL_BIAS_SOL": [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3],
+    # Bucket bias corrections
+    "CRYPTO_CENTER_BUCKET_BIAS": [0.80, 0.85, 0.90, 0.95, 1.00],
+    "CRYPTO_TAIL_BUCKET_MULTIPLIER": [0.90, 0.95, 1.00, 1.05, 1.10, 1.20],
+}
+
+# =============================================================================
+# SPORTS-SPECIFIC MUTATION SPACE
+# =============================================================================
+
+SPORTS_MUTATION_SPACE = {
+    # Home court advantage (points)
+    "SPORTS_HOME_COURT_ADVANTAGE": [2.0, 2.5, 3.0, 3.2, 3.5, 4.0, 4.5],
+    # Game margin stdev for logistic conversion
+    "SPORTS_NBA_GAME_STDEV": [9.0, 10.0, 11.0, 11.5, 12.0, 13.0, 14.0],
+    # Recent form weight
+    "SPORTS_RECENT_FORM_WEIGHT": [0.10, 0.20, 0.30, 0.40, 0.50],
+    # Edge threshold (percentage points)
+    "SPORTS_MIN_EDGE_PCT": [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0],
+    # Position sizing
+    "SPORTS_CONTRACTS_PER_TRADE": [3, 5, 8, 10, 15],
+    "SPORTS_MAX_POSITION_DOLLARS": [3.0, 5.0, 7.0, 10.0],
+}
+
 
 # =============================================================================
 # WEATHER SCENARIO SIMULATOR
@@ -306,18 +344,207 @@ def generate_weather_scenario(
 
 
 # =============================================================================
+# CRYPTO SCENARIO SIMULATOR
+# =============================================================================
+
+@dataclass
+class SimulatedCryptoMarket:
+    """A synthetic log-normal crypto range bucket market."""
+    asset: str
+    bucket_low: float      # normalized: current_price = 1.0
+    bucket_high: float
+    is_center: bool        # True if bucket is within ~2 bucket-widths of current price
+    yes_ask_cents: float
+    yes_bid_cents: float
+    true_probability: float  # P(price lands here) given true vol
+
+
+# Realistic annualized vol ranges per asset
+CRYPTO_VOL_RANGES = {
+    "BTC": (0.30, 1.20),
+    "ETH": (0.40, 1.50),
+    "SOL": (0.60, 2.00),
+}
+CRYPTO_ASSETS_SIM = ["BTC", "ETH", "SOL"]
+
+
+def calc_lognormal_bucket_prob(
+    current_price: float,
+    bucket_low: float,
+    bucket_high: float,
+    period_vol: float,
+) -> float:
+    """P(lognormal price lands in [bucket_low, bucket_high]) given period_vol."""
+    if period_vol <= 0:
+        return 0.999 if bucket_low <= current_price <= bucket_high else 0.001
+    if bucket_low <= 0:
+        z = math.log(bucket_high / current_price) / period_vol
+        return max(0.001, min(0.999, normal_cdf(z)))
+    if bucket_high >= current_price * 5:
+        z = math.log(bucket_low / current_price) / period_vol
+        return max(0.001, min(0.999, 1.0 - normal_cdf(z)))
+    z_low = math.log(bucket_low / current_price) / period_vol
+    z_high = math.log(bucket_high / current_price) / period_vol
+    return max(0.001, min(0.999, normal_cdf(z_high) - normal_cdf(z_low)))
+
+
+def generate_crypto_scenario(
+    rng: np.random.Generator,
+    n_buckets: int = 13,
+) -> tuple[list[SimulatedCryptoMarket], dict]:
+    """
+    Generate one synthetic crypto scenario (3 assets, n_buckets each).
+
+    Retail bias: center buckets are overpriced (retail assumes 'crypto stays put')
+    by pricing with a systematically lower vol. Tail buckets use more accurate vol.
+
+    Returns:
+        (markets, outcomes) where outcomes[asset] = {actual_price, period_vol, ...}
+    """
+    markets = []
+    outcomes = {}
+    current_price = 1.0
+    half = n_buckets // 2
+
+    for asset in CRYPTO_ASSETS_SIM:
+        vol_low, vol_high = CRYPTO_VOL_RANGES[asset]
+        true_annual_vol = rng.uniform(vol_low, vol_high)
+        hours_to_settle = float(rng.uniform(1.0, 23.0))
+        true_period_vol = (true_annual_vol / math.sqrt(365)) * math.sqrt(hours_to_settle / 24.0)
+
+        # Bucket width ~2.5% of price (models BTC $250/$10k, ETH $25/$1k, SOL $2/$80)
+        bucket_width = 0.025
+
+        for i in range(-half, half + 1):
+            bucket_low = current_price * (1 + i * bucket_width)
+            bucket_high = current_price * (1 + (i + 1) * bucket_width)
+            is_center = abs(i) <= 2
+
+            true_prob = calc_lognormal_bucket_prob(
+                current_price, bucket_low, bucket_high, true_period_vol
+            )
+
+            # Retail prices center buckets with underestimated vol (they think price won't move)
+            if is_center:
+                retail_vol = true_annual_vol * rng.uniform(0.55, 0.75)
+            else:
+                retail_vol = true_annual_vol * rng.uniform(0.80, 1.05)
+
+            retail_period_vol = (retail_vol / math.sqrt(365)) * math.sqrt(hours_to_settle / 24.0)
+            market_prob = calc_lognormal_bucket_prob(
+                current_price, bucket_low, bucket_high, retail_period_vol
+            )
+            market_prob = max(0.01, min(0.99, market_prob + rng.normal(0, 0.012)))
+
+            spread = rng.uniform(2.0, 6.0)
+            mid = market_prob * 100
+            markets.append(SimulatedCryptoMarket(
+                asset=asset,
+                bucket_low=bucket_low,
+                bucket_high=bucket_high,
+                is_center=is_center,
+                yes_ask_cents=round(min(99, mid + spread / 2), 1),
+                yes_bid_cents=round(max(1, mid - spread / 2), 1),
+                true_probability=true_prob,
+            ))
+
+        actual_price = current_price * math.exp(rng.normal(0, true_period_vol))
+        outcomes[asset] = {
+            "actual_price": actual_price,
+            "true_annual_vol": true_annual_vol,
+            "period_vol": true_period_vol,
+            "hours_to_settle": hours_to_settle,
+        }
+
+    return markets, outcomes
+
+
+# =============================================================================
+# SPORTS SCENARIO SIMULATOR
+# =============================================================================
+
+@dataclass
+class SimulatedSportsMarket:
+    """A synthetic NBA game win-probability market (YES = home team wins)."""
+    game_id: str
+    home_strength: float   # net adj. point differential per game
+    away_strength: float
+    yes_ask_cents: float
+    yes_bid_cents: float
+    true_win_prob: float   # ground-truth P(home wins)
+
+
+# Ground-truth NBA parameters used in simulation (not tunable — fixed reality)
+_TRUE_HCA = 3.2
+_TRUE_STDEV = 11.5
+
+
+def logistic_win_prob(point_diff: float, stdev: float) -> float:
+    """P(home wins) given expected point differential and game stdev."""
+    return max(0.05, min(0.95, normal_cdf(point_diff / stdev)))
+
+
+def generate_sports_scenario(
+    rng: np.random.Generator,
+    n_games: int = 5,
+) -> tuple[list[SimulatedSportsMarket], dict]:
+    """
+    Generate n_games synthetic NBA game markets.
+
+    Retail bias: slight underestimation of home court advantage (retail focuses on
+    overall records, not home/away splits) plus random narrative noise.
+
+    Returns:
+        (markets, outcomes) where outcomes[game_id] = {home_won, true_win_prob}
+    """
+    markets = []
+    outcomes = {}
+
+    for g in range(n_games):
+        game_id = f"GAME{g}"
+        # Team strength from realistic NBA distribution (~N(0, 5 pts/game spread)
+        home_strength = float(rng.normal(0, 5.0))
+        away_strength = float(rng.normal(0, 5.0))
+
+        # Ground truth
+        true_diff = home_strength - away_strength + _TRUE_HCA
+        true_win_prob = logistic_win_prob(true_diff, _TRUE_STDEV)
+
+        # Retail pricing: underweights HCA (uses ~85% of true value), adds noise
+        retail_diff = home_strength - away_strength + _TRUE_HCA * 0.85
+        retail_win_prob = logistic_win_prob(retail_diff, _TRUE_STDEV * 1.08)
+        market_prob = max(0.05, min(0.95, retail_win_prob + float(rng.normal(0, 0.04))))
+
+        spread = rng.uniform(2.0, 5.0)
+        mid = market_prob * 100
+        markets.append(SimulatedSportsMarket(
+            game_id=game_id,
+            home_strength=home_strength,
+            away_strength=away_strength,
+            yes_ask_cents=round(min(97, mid + spread / 2), 1),
+            yes_bid_cents=round(max(3, mid - spread / 2), 1),
+            true_win_prob=true_win_prob,
+        ))
+
+        home_won = bool(rng.random() < true_win_prob)
+        outcomes[game_id] = {"home_won": home_won, "true_win_prob": true_win_prob}
+
+    return markets, outcomes
+
+
+# =============================================================================
 # REAL OUTCOME DATA LOADING
 # =============================================================================
 
-def load_real_outcomes() -> list[dict]:
+def load_real_outcomes(strategy: str = "weather") -> list[dict]:
     """
     Load real settlement data from real_outcomes.json (written by settlement_tracker).
 
-    Returns a list of real outcome scenarios that can replace synthetic scenarios
-    in backtesting. Each entry contains the data needed to reconstruct a
-    SimulatedMarket + true_temps pair from actual trading results.
+    Args:
+        strategy: Filter to "weather", "crypto", or "sports" outcomes.
 
-    Returns empty list if file doesn't exist, is empty, or has no weather outcomes.
+    Returns a list of real outcome records for the specified strategy.
+    Returns empty list if file doesn't exist, is empty, or has no matching outcomes.
     """
     if not REAL_OUTCOMES_FILE.exists():
         return []
@@ -332,15 +559,21 @@ def load_real_outcomes() -> list[dict]:
     if not outcomes:
         return []
 
-    # Filter to weather trades only (have forecast/actual temp data)
-    weather_outcomes = [
-        o for o in outcomes
-        if o.get("strategy") == "weather"
-        and o.get("forecast_temp") is not None
-        and o.get("actual_temp") is not None
-    ]
+    if strategy == "weather":
+        # Weather outcomes need forecast + actual temp for scenario reconstruction
+        return [
+            o for o in outcomes
+            if o.get("strategy") == "weather"
+            and o.get("forecast_temp") is not None
+            and o.get("actual_temp") is not None
+        ]
 
-    return weather_outcomes
+    # Crypto and sports: just need strategy tag + settlement result + P&L
+    return [
+        o for o in outcomes
+        if o.get("strategy") == strategy
+        and o.get("settlement_result") in ("yes", "no")
+    ]
 
 
 def real_outcome_to_scenario(outcome: dict) -> tuple[list[SimulatedMarket], dict]:
@@ -708,6 +941,7 @@ def load_strategy_params() -> dict:
         import candidate_strategy as strat
         importlib.reload(strat)
         return {
+            # Weather params
             "forecast_stdev": strat.get_forecast_stdev(),
             "edge_threshold_cents": strat.EDGE_THRESHOLD_CENTS,
             "contracts_per_trade": strat.CONTRACTS_PER_TRADE,
@@ -721,6 +955,24 @@ def load_strategy_params() -> dict:
             "min_volume": strat.MIN_VOLUME,
             "tight_ensemble_threshold": strat.TIGHT_ENSEMBLE_THRESHOLD,
             "tight_ensemble_multiplier": strat.TIGHT_ENSEMBLE_MULTIPLIER,
+            # Crypto params
+            "crypto_min_edge_cents": strat.CRYPTO_MIN_EDGE_CENTS,
+            "crypto_contracts_per_trade": strat.CRYPTO_CONTRACTS_PER_TRADE,
+            "crypto_max_position_dollars": strat.CRYPTO_MAX_POSITION_DOLLARS,
+            "crypto_vol_biases": {
+                "BTC": strat.CRYPTO_VOL_BIAS_BTC,
+                "ETH": strat.CRYPTO_VOL_BIAS_ETH,
+                "SOL": strat.CRYPTO_VOL_BIAS_SOL,
+            },
+            "crypto_center_bucket_bias": strat.CRYPTO_CENTER_BUCKET_BIAS,
+            "crypto_tail_bucket_multiplier": strat.CRYPTO_TAIL_BUCKET_MULTIPLIER,
+            # Sports params
+            "sports_home_court_advantage": strat.SPORTS_HOME_COURT_ADVANTAGE,
+            "sports_nba_game_stdev": strat.SPORTS_NBA_GAME_STDEV,
+            "sports_recent_form_weight": strat.SPORTS_RECENT_FORM_WEIGHT,
+            "sports_min_edge_pct": strat.SPORTS_MIN_EDGE_PCT,
+            "sports_contracts_per_trade": strat.SPORTS_CONTRACTS_PER_TRADE,
+            "sports_max_position_dollars": strat.SPORTS_MAX_POSITION_DOLLARS,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -902,6 +1154,245 @@ def settle_trades(
             "won": pnl > 0,
             "true_temp": round(true_temp, 1),
             "forecast_temp": round(city_info["forecast"], 1),
+        })
+
+    return results
+
+
+# =============================================================================
+# CRYPTO EDGE DETECTION & SETTLEMENT
+# =============================================================================
+
+@dataclass
+class CryptoDetectedEdge:
+    """An edge found by our model in a simulated crypto market."""
+    market: SimulatedCryptoMarket
+    fair_value_cents: float
+    edge_cents: float
+    side: str        # "buy_yes" or "buy_no"
+    contracts: int
+    cost_dollars: float
+
+
+def detect_crypto_edges(
+    markets: list[SimulatedCryptoMarket],
+    outcomes: dict,
+    params: dict,
+) -> list[CryptoDetectedEdge]:
+    """
+    Run crypto edge detection against simulated markets using candidate params.
+
+    In simulation the 'true_annual_vol' is accessible from outcomes — our model
+    applies CRYPTO_VOL_BIAS_* to that, testing whether the bias helps calibration.
+    In production, realized vol comes from the API; the bias scales it.
+    """
+    if "error" in params:
+        return []
+
+    edges = []
+    min_edge = params.get("crypto_min_edge_cents", 4.0)
+    contracts_base = params.get("crypto_contracts_per_trade", 5)
+    max_pos = params.get("crypto_max_position_dollars", 5.0)
+    vol_biases = params.get("crypto_vol_biases", {"BTC": 1.0, "ETH": 1.0, "SOL": 1.0})
+    center_bias = params.get("crypto_center_bucket_bias", 0.95)
+    tail_mult = params.get("crypto_tail_bucket_multiplier", 1.0)
+
+    for m in markets:
+        asset_outcome = outcomes.get(m.asset)
+        if not asset_outcome:
+            continue
+
+        true_annual_vol = asset_outcome["true_annual_vol"]
+        hours_to_settle = asset_outcome["hours_to_settle"]
+
+        # Our model applies a per-asset bias to the realized vol estimate
+        vol_bias = vol_biases.get(m.asset, 1.0)
+        model_annual_vol = true_annual_vol * vol_bias
+        model_period_vol = (model_annual_vol / math.sqrt(365)) * math.sqrt(hours_to_settle / 24.0)
+
+        current_price = 1.0
+        fair_yes_prob = calc_lognormal_bucket_prob(
+            current_price, m.bucket_low, m.bucket_high, model_period_vol
+        )
+
+        # Apply bucket bias corrections
+        if m.is_center:
+            fair_yes_prob = max(0.001, min(0.999, fair_yes_prob * center_bias))
+        else:
+            fair_yes_prob = max(0.001, min(0.999, fair_yes_prob * tail_mult))
+
+        fair_yes_cents = fair_yes_prob * 100.0
+        fair_no_cents = 100.0 - fair_yes_cents
+
+        # BUY YES edge (underpriced tail or any bucket)
+        if m.yes_ask_cents > 0:
+            buy_yes_edge = fair_yes_cents - m.yes_ask_cents
+            if buy_yes_edge > min_edge:
+                cost_per = m.yes_ask_cents / 100.0
+                n = min(contracts_base, max(1, int(max_pos / cost_per))) if cost_per > 0 else contracts_base
+                edges.append(CryptoDetectedEdge(
+                    market=m,
+                    fair_value_cents=round(fair_yes_cents, 2),
+                    edge_cents=round(buy_yes_edge, 2),
+                    side="buy_yes",
+                    contracts=n,
+                    cost_dollars=round(n * cost_per, 4),
+                ))
+
+        # BUY NO edge (overpriced center bucket)
+        if m.yes_bid_cents > 0:
+            buy_no_edge = fair_no_cents - (100.0 - m.yes_bid_cents)
+            if buy_no_edge > min_edge:
+                no_price = 100.0 - m.yes_bid_cents
+                cost_per = no_price / 100.0
+                n = min(contracts_base, max(1, int(max_pos / cost_per))) if cost_per > 0 else contracts_base
+                edges.append(CryptoDetectedEdge(
+                    market=m,
+                    fair_value_cents=round(fair_no_cents, 2),
+                    edge_cents=round(buy_no_edge, 2),
+                    side="buy_no",
+                    contracts=n,
+                    cost_dollars=round(n * cost_per, 4),
+                ))
+
+    return edges
+
+
+def settle_crypto_trades(
+    edges: list[CryptoDetectedEdge],
+    outcomes: dict,
+) -> list[dict]:
+    """Settle crypto trades against drawn settlement prices."""
+    results = []
+    for e in edges:
+        m = e.market
+        asset_outcome = outcomes.get(m.asset)
+        if not asset_outcome:
+            continue
+
+        actual_price = asset_outcome["actual_price"]
+        yes_happened = m.bucket_low <= actual_price < m.bucket_high
+
+        if e.side == "buy_yes":
+            pnl = e.contracts * (100 - m.yes_ask_cents) / 100.0 if yes_happened else -e.cost_dollars
+        else:
+            no_price = 100 - m.yes_bid_cents
+            pnl = e.contracts * (100 - no_price) / 100.0 if not yes_happened else -e.cost_dollars
+
+        results.append({
+            "asset": m.asset,
+            "side": e.side,
+            "edge_cents": e.edge_cents,
+            "contracts": e.contracts,
+            "cost": e.cost_dollars,
+            "pnl": round(pnl, 4),
+            "won": pnl > 0,
+        })
+
+    return results
+
+
+# =============================================================================
+# SPORTS EDGE DETECTION & SETTLEMENT
+# =============================================================================
+
+@dataclass
+class SportsDetectedEdge:
+    """An edge found by our model in a simulated sports market."""
+    market: SimulatedSportsMarket
+    fair_value_cents: float
+    edge_cents: float
+    side: str        # "buy_yes" or "buy_no"
+    contracts: int
+    cost_dollars: float
+
+
+def detect_sports_edges(
+    markets: list[SimulatedSportsMarket],
+    params: dict,
+) -> list[SportsDetectedEdge]:
+    """
+    Run sports edge detection against simulated NBA markets using candidate params.
+
+    Our model's win probability uses SPORTS_HOME_COURT_ADVANTAGE and
+    SPORTS_NBA_GAME_STDEV. When these diverge from the true values, we
+    under/over-estimate win probability and generate wrong edges.
+    """
+    if "error" in params:
+        return []
+
+    edges = []
+    hca = params.get("sports_home_court_advantage", 3.2)
+    stdev = params.get("sports_nba_game_stdev", 11.5)
+    min_edge = params.get("sports_min_edge_pct", 5.0)
+    contracts_base = params.get("sports_contracts_per_trade", 5)
+    max_pos = params.get("sports_max_position_dollars", 5.0)
+
+    for m in markets:
+        # Our model's estimated win probability for home team
+        model_diff = (m.home_strength - m.away_strength + hca)
+        model_win_prob = logistic_win_prob(model_diff, stdev)
+        fair_yes_cents = model_win_prob * 100.0
+        fair_no_cents = 100.0 - fair_yes_cents
+
+        buy_yes_edge = fair_yes_cents - m.yes_ask_cents
+        buy_no_edge = fair_no_cents - (100.0 - m.yes_bid_cents)
+
+        if buy_yes_edge > min_edge:
+            cost_per = m.yes_ask_cents / 100.0
+            n = min(contracts_base, max(1, int(max_pos / cost_per))) if cost_per > 0 else contracts_base
+            edges.append(SportsDetectedEdge(
+                market=m,
+                fair_value_cents=round(fair_yes_cents, 2),
+                edge_cents=round(buy_yes_edge, 2),
+                side="buy_yes",
+                contracts=n,
+                cost_dollars=round(n * cost_per, 4),
+            ))
+        elif buy_no_edge > min_edge:
+            no_price = 100.0 - m.yes_bid_cents
+            cost_per = no_price / 100.0
+            n = min(contracts_base, max(1, int(max_pos / cost_per))) if cost_per > 0 else contracts_base
+            edges.append(SportsDetectedEdge(
+                market=m,
+                fair_value_cents=round(fair_no_cents, 2),
+                edge_cents=round(buy_no_edge, 2),
+                side="buy_no",
+                contracts=n,
+                cost_dollars=round(n * cost_per, 4),
+            ))
+
+    return edges
+
+
+def settle_sports_trades(
+    edges: list[SportsDetectedEdge],
+    outcomes: dict,
+) -> list[dict]:
+    """Settle sports trades against drawn game outcomes."""
+    results = []
+    for e in edges:
+        m = e.market
+        outcome = outcomes.get(m.game_id)
+        if not outcome:
+            continue
+
+        yes_happened = outcome["home_won"]
+
+        if e.side == "buy_yes":
+            pnl = e.contracts * (100 - m.yes_ask_cents) / 100.0 if yes_happened else -e.cost_dollars
+        else:
+            no_price = 100 - m.yes_bid_cents
+            pnl = e.contracts * (100 - no_price) / 100.0 if not yes_happened else -e.cost_dollars
+
+        results.append({
+            "game_id": m.game_id,
+            "side": e.side,
+            "edge_cents": e.edge_cents,
+            "contracts": e.contracts,
+            "cost": e.cost_dollars,
+            "pnl": round(pnl, 4),
+            "won": pnl > 0,
         })
 
     return results
@@ -1119,6 +1610,136 @@ def run_weather_backtest(
 
 
 # =============================================================================
+# CRYPTO BACKTEST
+# =============================================================================
+
+def run_crypto_backtest(
+    seed: int = 42,
+    n_scenarios: int = 200,
+) -> dict:
+    """
+    Run a full crypto strategy backtest using simulated log-normal bucket markets.
+
+    1. Load candidate_strategy params
+    2. Generate n_scenarios crypto market days (3 assets × 13 buckets each)
+    3. Detect edges, scale positions to balance
+    4. Settle against drawn prices, accumulate P&L
+    5. Score with the same composite function as weather
+
+    Returns dict with all metrics.
+    """
+    params = load_strategy_params()
+    if "error" in params:
+        return {"error": params["error"], "score": -999.0}
+
+    initial_balance = 100.0
+    max_pos = params.get("crypto_max_position_dollars", 5.0)
+    rng = np.random.default_rng(seed)
+    all_results = []
+    balance = initial_balance
+
+    for _ in range(n_scenarios):
+        if balance <= 1.0:
+            break
+
+        markets, outcomes = generate_crypto_scenario(rng)
+        edges = detect_crypto_edges(markets, outcomes, params)
+
+        edges.sort(key=lambda e: e.edge_cents, reverse=True)
+        daily_budget = balance * 0.20
+        spent = 0.0
+        filtered = []
+
+        for e in edges:
+            cost_per = (
+                e.market.yes_ask_cents / 100.0
+                if e.side == "buy_yes"
+                else (100 - e.market.yes_bid_cents) / 100.0
+            )
+            max_single = min(balance * 0.03, max_pos)
+            if cost_per > 0:
+                e.contracts = min(e.contracts, max(1, int(max_single / cost_per)))
+                e.cost_dollars = round(e.contracts * cost_per, 4)
+            if spent + e.cost_dollars > daily_budget:
+                continue
+            spent += e.cost_dollars
+            filtered.append(e)
+
+        settled = settle_crypto_trades(filtered, outcomes)
+        for t in settled:
+            balance += t["pnl"]
+            t["balance_after"] = round(balance, 2)
+        all_results.extend(settled)
+
+    return score_simulation(all_results, initial_balance=initial_balance)
+
+
+# =============================================================================
+# SPORTS BACKTEST
+# =============================================================================
+
+def run_sports_backtest(
+    seed: int = 42,
+    n_scenarios: int = 200,
+) -> dict:
+    """
+    Run a full sports strategy backtest using simulated NBA game markets.
+
+    1. Load candidate_strategy params
+    2. Generate n_scenarios NBA game days (5 games each)
+    3. Detect edges, scale positions to balance
+    4. Settle against drawn game outcomes, accumulate P&L
+    5. Score with the same composite function as weather
+
+    Returns dict with all metrics.
+    """
+    params = load_strategy_params()
+    if "error" in params:
+        return {"error": params["error"], "score": -999.0}
+
+    initial_balance = 100.0
+    max_pos = params.get("sports_max_position_dollars", 5.0)
+    rng = np.random.default_rng(seed)
+    all_results = []
+    balance = initial_balance
+
+    for _ in range(n_scenarios):
+        if balance <= 1.0:
+            break
+
+        markets, outcomes = generate_sports_scenario(rng)
+        edges = detect_sports_edges(markets, params)
+
+        edges.sort(key=lambda e: e.edge_cents, reverse=True)
+        daily_budget = balance * 0.20
+        spent = 0.0
+        filtered = []
+
+        for e in edges:
+            cost_per = (
+                e.market.yes_ask_cents / 100.0
+                if e.side == "buy_yes"
+                else (100 - e.market.yes_bid_cents) / 100.0
+            )
+            max_single = min(balance * 0.03, max_pos)
+            if cost_per > 0:
+                e.contracts = min(e.contracts, max(1, int(max_single / cost_per)))
+                e.cost_dollars = round(e.contracts * cost_per, 4)
+            if spent + e.cost_dollars > daily_budget:
+                continue
+            spent += e.cost_dollars
+            filtered.append(e)
+
+        settled = settle_sports_trades(filtered, outcomes)
+        for t in settled:
+            balance += t["pnl"]
+            t["balance_after"] = round(balance, 2)
+        all_results.extend(settled)
+
+    return score_simulation(all_results, initial_balance=initial_balance)
+
+
+# =============================================================================
 # PARAMETER MUTATION
 # =============================================================================
 
@@ -1167,10 +1788,18 @@ def get_current_value(source: str, param_name: str):
     return None
 
 
-def random_mutation(source: str) -> tuple[str, object, str]:
-    """Pick a random parameter and a random value for it."""
-    param = random.choice(list(MUTATION_SPACE.keys()))
-    new_val = random.choice(MUTATION_SPACE[param])
+_STRATEGY_MUTATION_SPACES = {
+    "weather": MUTATION_SPACE,
+    "crypto": CRYPTO_MUTATION_SPACE,
+    "sports": SPORTS_MUTATION_SPACE,
+}
+
+
+def random_mutation(source: str, strategy: str = "weather") -> tuple[str, object, str]:
+    """Pick a random parameter and a random value for it from the strategy's mutation space."""
+    space = _STRATEGY_MUTATION_SPACES.get(strategy, MUTATION_SPACE)
+    param = random.choice(list(space.keys()))
+    new_val = random.choice(space[param])
     return param, new_val, "Random exploration"
 
 
@@ -1448,26 +2077,223 @@ def run_research(
         pass  # Non-critical
 
 
+def _run_research_loop(
+    strategy: str,
+    backtest_fn,
+    label: str,
+    max_iterations: int,
+    n_scenarios: int,
+    verbose: bool,
+):
+    """
+    Generic research loop body shared by weather, crypto, and sports variants.
+
+    Args:
+        strategy:     "weather", "crypto", or "sports"
+        backtest_fn:  callable(seed, n_scenarios) -> metrics dict
+        label:        display name for console output
+        max_iterations, n_scenarios, verbose: as in run_research
+    """
+    console.print(f"\n[bold cyan]{'=' * 65}[/bold cyan]")
+    console.print(f"[bold cyan]  {label.upper()} AUTORESEARCH: Strategy Optimization Loop  [/bold cyan]")
+    console.print(f"[bold cyan]{'=' * 65}[/bold cyan]\n")
+
+    console.print(f"[dim]Running baseline {strategy} backtest...[/dim]")
+    baseline = backtest_fn(seed=42, n_scenarios=n_scenarios)
+    if "error" in baseline:
+        console.print(f"[red]Baseline failed: {baseline['error']}[/red]")
+        return
+
+    console.print(f"[green]Baseline score: {baseline['score']:.4f}[/green]")
+    console.print(
+        f"  Sortino: {baseline['sortino']:.3f} | "
+        f"ROI: {baseline['roi_pct']:.2f}% | "
+        f"Win: {baseline['win_rate']:.1f}% | "
+        f"MaxDD: {baseline['max_dd_pct']:.2f}% | "
+        f"Trades: {baseline['total_trades']} | "
+        f"PF: {baseline['profit_factor']:.2f}\n"
+    )
+
+    best_score = baseline["score"]
+    improvements = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task(f"{label} research loop", total=max_iterations)
+
+        for i in range(1, max_iterations + 1):
+            source = read_strategy_file()
+            param, new_val, _ = random_mutation(source, strategy=strategy)
+            old_val = get_current_value(source, param)
+
+            if old_val == new_val:
+                progress.update(task, advance=1)
+                continue
+
+            progress.update(task, description=f"Iter {i}/{max_iterations}: {param}={new_val}")
+
+            new_source = mutate_parameter(source, param, new_val)
+            write_strategy_file(new_source)
+
+            metrics = backtest_fn(seed=42 + i, n_scenarios=n_scenarios)
+            if "error" in metrics:
+                write_strategy_file(source)
+                progress.update(task, advance=1)
+                continue
+
+            new_score = metrics["score"]
+            kept = new_score > best_score
+
+            if kept:
+                best_score = new_score
+                improvements += 1
+                git_commit(
+                    f"{label}Research iter {i}: {param}={new_val} "
+                    f"score={new_score:.4f} sortino={metrics['sortino']:.3f}"
+                )
+                if alert_research_improvement is not None:
+                    try:
+                        alert_research_improvement(param, old_val, new_val, new_score)
+                    except Exception:
+                        pass
+                if verbose:
+                    console.print(
+                        f"  [green]+ Iter {i}: {param} {old_val}->{new_val} "
+                        f"score={new_score:.4f} sortino={metrics['sortino']:.3f} "
+                        f"roi={metrics['roi_pct']:.1f}% win={metrics['win_rate']:.0f}% KEPT[/green]"
+                    )
+            else:
+                write_strategy_file(source)
+                git_revert()
+                if verbose and i % 5 == 0:
+                    console.print(
+                        f"  [dim]- Iter {i}: {param} {old_val}->{new_val} "
+                        f"score={new_score:.4f} (vs {best_score:.4f}) REVERTED[/dim]"
+                    )
+
+            log_result(i, param, old_val, new_val, metrics, kept)
+            progress.update(task, advance=1)
+            time.sleep(0.05)
+
+    console.print(f"\n[bold cyan]{'=' * 65}[/bold cyan]")
+    console.print(f"[bold]{label} Research Complete: {max_iterations} iterations[/bold]")
+    console.print(f"  Improvements found: {improvements}")
+    console.print(f"  Best score: {best_score:.4f} (baseline was {baseline['score']:.4f})")
+
+    final = backtest_fn(seed=42, n_scenarios=n_scenarios)
+    if "error" not in final:
+        console.print(f"\n[bold]Final Strategy Performance:[/bold]")
+        console.print(f"  Sortino:       {final['sortino']:.3f}")
+        console.print(f"  ROI:           {final['roi_pct']:.2f}%")
+        console.print(f"  Win Rate:      {final['win_rate']:.1f}%")
+        console.print(f"  Max Drawdown:  {final['max_dd_pct']:.2f}%")
+        console.print(f"  Profit Factor: {final['profit_factor']:.2f}")
+        console.print(f"  Total Trades:  {final['total_trades']}")
+        console.print(f"  Total P&L:     ${final['total_pnl']:.2f}")
+    console.print(f"[bold cyan]{'=' * 65}[/bold cyan]\n")
+
+
+def run_crypto_research(
+    max_iterations: int = None,
+    n_scenarios: int = 200,
+    verbose: bool = True,
+):
+    """
+    Run the Crypto AutoResearch loop.
+
+    Optimizes: CRYPTO_MIN_EDGE_CENTS, CRYPTO_VOL_BIAS_*, CRYPTO_CENTER_BUCKET_BIAS,
+               CRYPTO_TAIL_BUCKET_MULTIPLIER, CRYPTO_CONTRACTS_PER_TRADE,
+               CRYPTO_MAX_POSITION_DOLLARS.
+    """
+    max_iterations = max_iterations or config.AUTORESEARCH_MAX_ITERATIONS
+    _run_research_loop(
+        strategy="crypto",
+        backtest_fn=run_crypto_backtest,
+        label="Crypto",
+        max_iterations=max_iterations,
+        n_scenarios=n_scenarios,
+        verbose=verbose,
+    )
+    # Regenerate strategy doc after research
+    try:
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from strategy_doc import generate_strategy_doc
+        generate_strategy_doc()
+    except Exception:
+        pass
+
+
+def run_sports_research(
+    max_iterations: int = None,
+    n_scenarios: int = 200,
+    verbose: bool = True,
+):
+    """
+    Run the Sports AutoResearch loop.
+
+    Optimizes: SPORTS_HOME_COURT_ADVANTAGE, SPORTS_NBA_GAME_STDEV,
+               SPORTS_RECENT_FORM_WEIGHT, SPORTS_MIN_EDGE_PCT,
+               SPORTS_CONTRACTS_PER_TRADE, SPORTS_MAX_POSITION_DOLLARS.
+    """
+    max_iterations = max_iterations or config.AUTORESEARCH_MAX_ITERATIONS
+    _run_research_loop(
+        strategy="sports",
+        backtest_fn=run_sports_backtest,
+        label="Sports",
+        max_iterations=max_iterations,
+        n_scenarios=n_scenarios,
+        verbose=verbose,
+    )
+    try:
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from strategy_doc import generate_strategy_doc
+        generate_strategy_doc()
+    except Exception:
+        pass
+
+
 # =============================================================================
 # CLI ENTRY POINT
 # =============================================================================
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Weather AutoResearch Loop")
+    parser = argparse.ArgumentParser(description="AutoResearch Loop")
     parser.add_argument("--iterations", type=int, default=50, help="Number of experiments")
-    parser.add_argument("--scenarios", type=int, default=200, help="Weather days per backtest")
+    parser.add_argument("--scenarios", type=int, default=200, help="Days/games per backtest")
     parser.add_argument("--quiet", action="store_true", help="Less output")
     parser.add_argument("--no-claude", action="store_true", help="Random mutations only (no Claude API)")
     parser.add_argument(
+        "--strategy",
+        choices=["weather", "crypto", "sports", "all"],
+        default="weather",
+        help="Which strategy to optimize (default: weather)",
+    )
+    parser.add_argument(
         "--use-real-data", action="store_true",
-        help="Incorporate real settlement outcomes from real_outcomes.json"
+        help="Incorporate real settlement outcomes from real_outcomes.json (weather only)"
     )
     args = parser.parse_args()
 
-    run_research(
-        max_iterations=args.iterations,
-        n_scenarios=args.scenarios,
-        verbose=not args.quiet,
-        use_real_data=args.use_real_data,
-    )
+    if args.strategy == "weather" or args.strategy == "all":
+        run_research(
+            max_iterations=args.iterations,
+            n_scenarios=args.scenarios,
+            verbose=not args.quiet,
+            use_real_data=args.use_real_data,
+        )
+    if args.strategy == "crypto" or args.strategy == "all":
+        run_crypto_research(
+            max_iterations=args.iterations,
+            n_scenarios=args.scenarios,
+            verbose=not args.quiet,
+        )
+    if args.strategy == "sports" or args.strategy == "all":
+        run_sports_research(
+            max_iterations=args.iterations,
+            n_scenarios=args.scenarios,
+            verbose=not args.quiet,
+        )

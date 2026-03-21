@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ippo.hourly-update</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/benjamin/Desktop/ippo/.venv/bin/python</string>
+        <string>/Users/benjamin/Desktop/ippo/hourly_update.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/benjamin/Desktop/ippo</string>
+
+    <!-- Run at the top of every hour -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/benjamin/Desktop/ippo/output/hourly_update.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/benjamin/Desktop/ippo/output/hourly_update.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
