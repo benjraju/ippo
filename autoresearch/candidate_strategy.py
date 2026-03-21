@@ -28,7 +28,7 @@ MIN_EDGE = 0.06
 KELLY_MULT = 0.25
 
 # Maximum position as fraction of account
-MAX_POSITION_FRAC = 0.02
+MAX_POSITION_FRAC = 0.015
 
 # Market selection: minimum volume to consider
 MIN_VOLUME = 50
