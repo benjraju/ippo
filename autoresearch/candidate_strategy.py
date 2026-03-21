@@ -22,7 +22,7 @@ import numpy as np
 # =============================================================================
 
 # Minimum edge (estimated_prob - market_prob) to enter a trade
-MIN_EDGE = 0.05
+MIN_EDGE = 0.06
 
 # Kelly fraction multiplier (0.25 = quarter Kelly)
 KELLY_MULT = 0.25
