@@ -209,16 +209,44 @@ def _explain_change(param: str, old_val, new_val) -> str:
 
 
 def _send_telegram(text: str):
+    """Send a Telegram message, splitting at 4000 chars if needed."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         import requests
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-        }, timeout=10)
+
+        MAX_LEN = 4000
+        if len(text) <= MAX_LEN:
+            requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+            }, timeout=10)
+            return
+
+        # Split long messages on newline boundaries
+        chunks = []
+        remaining = text
+        while remaining:
+            if len(remaining) <= MAX_LEN:
+                chunks.append(remaining)
+                break
+            # Find last newline before the limit
+            split_at = remaining.rfind("\n", 0, MAX_LEN)
+            if split_at == -1:
+                split_at = MAX_LEN
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:].lstrip("\n")
+
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+            requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "parse_mode": "HTML",
+            }, timeout=10)
     except Exception:
         pass
 
@@ -360,3 +388,92 @@ def alert_daily_summary(trades: int, pnl: float, win_rate: float):
         f"Research: {total_experiments:,} experiments, "
         f"{total_improvements} improvements found"
     )
+
+
+def send_trade_alert(trade_details: dict):
+    """Send a single-trade execution notification.
+
+    Expected keys in trade_details:
+        side:       "yes" or "no"
+        ticker:     market ticker string
+        price:      entry price in cents (e.g. 25)
+        contracts:  number of contracts
+        risk:       max loss in dollars
+        target:     max gain in dollars
+        strategy:   strategy name (e.g. "weather", "crypto")
+        edge:       edge in cents (optional)
+    """
+    side = trade_details.get("side", "?").upper()
+    ticker = trade_details.get("ticker", "???")
+    price = trade_details.get("price", 0)
+    contracts = trade_details.get("contracts", 1)
+    risk = trade_details.get("risk", 0)
+    target = trade_details.get("target", 0)
+    strategy = trade_details.get("strategy", "")
+    edge = trade_details.get("edge", None)
+
+    strat_line = strategy.title() if strategy else "Manual"
+    if edge is not None:
+        strat_line += f" (edge: {edge:.0f}c)"
+
+    msg = (
+        f"<pre>"
+        f"TRADE EXECUTED\n"
+        f"  BUY {side} {ticker}\n"
+        f"  @ {price:.0f}c x {contracts}\n"
+        f"  Risk: ${risk:.2f} | Target: +${target:.2f}\n"
+        f"  Strategy: {strat_line}"
+        f"</pre>"
+    )
+
+    _log_to_file("Trade Executed", f"{side} {ticker} @ {price}c x{contracts}")
+    _send_telegram(msg)
+
+
+def send_settlement_alert(trade_details: dict):
+    """Send a settlement notification for a resolved position.
+
+    Expected keys in trade_details:
+        ticker:     market ticker string
+        side:       "yes" or "no"
+        won:        bool -- True if position won
+        pnl:        realized P&L in dollars (signed)
+        entry:      entry price in cents
+        nav:        current NAV after settlement (optional)
+        day_pnl:    day's running P&L (optional)
+    """
+    ticker = trade_details.get("ticker", "???")
+    side = trade_details.get("side", "?").upper()
+    won = trade_details.get("won", False)
+    pnl = trade_details.get("pnl", 0.0)
+    entry = trade_details.get("entry", 0)
+    nav = trade_details.get("nav", None)
+    day_pnl = trade_details.get("day_pnl", None)
+
+    if won:
+        header = "SETTLEMENT \u2014 WIN"
+        pnl_pct = ((1.0 / (entry / 100.0)) - 1) * 100 if entry > 0 else 0
+        detail = f"  {ticker} {side} settled @ $1.00"
+        pnl_line = f"  P&L: +${pnl:.2f} (+{pnl_pct:.0f}%)"
+    else:
+        header = "SETTLEMENT \u2014 LOSS"
+        detail = f"  {ticker} {side} expired worthless"
+        pnl_line = f"  P&L: -${abs(pnl):.2f}"
+
+    book_line = ""
+    if nav is not None:
+        sign = "+" if (day_pnl or pnl) >= 0 else ""
+        day_val = day_pnl if day_pnl is not None else pnl
+        book_line = f"\n  Book: ${nav:.2f} NAV ({sign}${day_val:.2f} today)"
+
+    msg = (
+        f"<pre>"
+        f"{header}\n"
+        f"{detail}\n"
+        f"{pnl_line}\n"
+        f"{book_line}"
+        f"</pre>"
+    )
+
+    _log_to_file("Settlement", f"{'WIN' if won else 'LOSS'} {ticker} {side} {pnl:+.2f}")
+    _send_telegram(msg)
