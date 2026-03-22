@@ -76,6 +76,7 @@ RESULTS_LOG = Path(__file__).parent / "results.log"
 REAL_OUTCOMES_FILE = Path(__file__).parent / "real_outcomes.json"
 KALSHI_CACHE_FILE = Path(__file__).parent / "kalshi_cache.json"
 HISTORICAL_SETTLEMENTS_FILE = Path(__file__).parent.parent / "output" / "historical_settlements_with_prices.json"
+BACKTEST_DATASET_FILE = Path(__file__).parent.parent / "output" / "backtest_dataset.json"
 
 # Legacy weight — no longer used (all scenarios are real historical data now).
 KALSHI_SCENARIO_WEIGHT = 0
@@ -1936,6 +1937,28 @@ def run_research(
 
     # Refresh data from Kalshi API (pulls new settlements since last run)
     refresh_historical_settlements()
+
+    # Build gold-standard dataset from price snapshots (if enough data exists)
+    try:
+        if BACKTEST_DATASET_FILE.exists():
+            with open(BACKTEST_DATASET_FILE, "r") as f:
+                _ds = json.load(f)
+            ds_count = _ds.get("matched", 0)
+            if ds_count > 0:
+                console.print(
+                    f"[green]Gold dataset: {ds_count} markets with REAL pre-settlement prices[/green]"
+                )
+        else:
+            # Try to build it
+            try:
+                from build_backtest_dataset import build_dataset
+                ds = build_dataset()
+                if ds:
+                    console.print(f"[green]Built gold dataset: {len(ds)} markets[/green]")
+            except Exception as e:
+                console.print(f"[dim]Gold dataset not available yet: {e}[/dim]")
+    except Exception:
+        pass
 
     # Load historical scenarios (shared across all backtests this session)
     historical_scenarios = load_historical_scenarios()
