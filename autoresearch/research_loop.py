@@ -450,6 +450,99 @@ def _infer_true_temp_from_group(group_markets: list[dict]) -> float | None:
     return None
 
 
+def refresh_historical_settlements():
+    """
+    Pull fresh settled markets from Kalshi API and merge into the historical file.
+    Called at the start of each AutoResearch cycle so the dataset grows daily.
+    New settlements are appended (deduplicated by ticker).
+    """
+    if KalshiClient is None:
+        return
+
+    try:
+        client = KalshiClient()
+    except Exception as e:
+        console.print(f"[yellow]Cannot connect to Kalshi for data refresh: {e}[/yellow]")
+        return
+
+    # Load existing data
+    existing_tickers = set()
+    existing_markets = []
+    if HISTORICAL_SETTLEMENTS_FILE.exists():
+        try:
+            with open(HISTORICAL_SETTLEMENTS_FILE, "r") as f:
+                old_data = json.load(f)
+            existing_markets = old_data.get("markets", [])
+            existing_tickers = {m.get("ticker") for m in existing_markets}
+        except Exception:
+            pass
+
+    # Fetch recent settled markets from all series
+    all_series = [
+        "KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHDEN", "KXHIGHDC", "KXHIGHLA",
+        "KXBTC", "KXETH", "KXSOL", "KXNBAGAME",
+    ]
+
+    new_count = 0
+    for series in all_series:
+        cursor = None
+        for page in range(10):  # Up to 1000 per series
+            try:
+                resp = client.get_markets(
+                    series_ticker=series, status="settled", limit=100, cursor=cursor,
+                )
+            except Exception:
+                break
+
+            markets = resp.get("markets", [])
+            if not markets:
+                break
+
+            for m in markets:
+                ticker = m.get("ticker", "")
+                if ticker in existing_tickers:
+                    continue  # Already have this one
+
+                existing_tickers.add(ticker)
+                existing_markets.append({
+                    "ticker": ticker,
+                    "title": m.get("title", ""),
+                    "series": series,
+                    "result": m.get("result", ""),
+                    "previous_price": m.get("previous_price_dollars"),
+                    "last_price": m.get("last_price_dollars"),
+                    "prev_yes_ask": m.get("previous_yes_ask_dollars"),
+                    "prev_yes_bid": m.get("previous_yes_bid_dollars"),
+                    "volume": m.get("volume_fp", 0),
+                    "open_interest": m.get("open_interest_fp", 0),
+                    "close_time": m.get("close_time", ""),
+                })
+                new_count += 1
+
+            cursor = resp.get("cursor")
+            if not cursor:
+                break
+
+            time.sleep(0.2)
+
+    if new_count > 0:
+        # Save merged data
+        merged = {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "total": len(existing_markets),
+            "markets": existing_markets,
+        }
+        try:
+            with open(HISTORICAL_SETTLEMENTS_FILE, "w") as f:
+                json.dump(merged, f)
+            console.print(f"[green]Data refresh: +{new_count} new settlements "
+                         f"({len(existing_markets)} total)[/green]")
+        except Exception as e:
+            console.print(f"[yellow]Failed to save refreshed data: {e}[/yellow]")
+    else:
+        console.print(f"[dim]Data refresh: no new settlements (have {len(existing_markets)})[/dim]")
+
+
 def load_historical_scenarios() -> list[tuple[list[SimulatedMarket], dict]]:
     """
     Load real settled weather market data from historical_settlements_with_prices.json
@@ -1841,7 +1934,10 @@ def run_research(
     console.print("[bold cyan]  AUTORESEARCH: Multi-Strategy Optimization Loop              [/bold cyan]")
     console.print("[bold cyan]================================================================[/bold cyan]\n")
 
-    # Load historical scenarios once (shared across all backtests this session)
+    # Refresh data from Kalshi API (pulls new settlements since last run)
+    refresh_historical_settlements()
+
+    # Load historical scenarios (shared across all backtests this session)
     historical_scenarios = load_historical_scenarios()
     if historical_scenarios:
         console.print(
