@@ -29,7 +29,7 @@ CONTRACTS_PER_TRADE = 8
 
 # NWS blend ratio: weight given to NWS official forecast vs. ensemble mean.
 # 0.0 = pure ensemble, 1.0 = pure NWS official. Currently 40% NWS, 60% ensemble.
-NWS_OFFICIAL_WEIGHT = 0.5
+NWS_OFFICIAL_WEIGHT = 0.3
 
 # City weights: relative weight for position sizing per city.
 # Higher weight = trade more contracts in that city.
