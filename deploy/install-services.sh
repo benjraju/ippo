@@ -26,8 +26,6 @@ for unit in \
     ippo-autoresearch.timer \
     ippo-settlement.service \
     ippo-settlement.timer \
-    ippo-hourly-update.service \
-    ippo-hourly-update.timer \
     ippo-health.service; do
     cp "${SYSTEMD_DIR}/${unit}" "${SYSTEMD_USER_DIR}/${unit}"
     echo "  Installed ${unit}"
@@ -48,7 +46,6 @@ systemctl enable --now ippo-health.service
 systemctl enable --now ippo-auto-trade.timer
 systemctl enable --now ippo-autoresearch.timer
 systemctl enable --now ippo-settlement.timer
-systemctl enable --now ippo-hourly-update.timer
 
 echo ""
 echo "=== Services installed and started ==="

@@ -346,39 +346,40 @@ def parse_btc_bucket(ticker: str, title: str) -> Optional[dict]:
     """
     title_lower = title.lower()
 
-    # Pattern: "between $X and $Y"
+    # Pattern: "between $X and $Y" (supports decimals)
     between_match = re.search(
-        r'between\s+\$?([\d,]+)\s+and\s+\$?([\d,]+)', title_lower
+        r'between\s+\$?([\d,.]+)\s+and\s+\$?([\d,.]+)', title_lower
     )
     if between_match:
         low = float(between_match.group(1).replace(",", ""))
         high = float(between_match.group(2).replace(",", ""))
-        return {"type": "bucket", "low": low, "high": high + 1}
+        # Kalshi "between $X and $Y" is inclusive; add epsilon for exclusive upper
+        return {"type": "bucket", "low": low, "high": high + 0.01}
 
     # Pattern: "X or above" or "above $X"
     if "above" in title_lower or ">" in title:
-        match = re.search(r'[\$>]\s*([\d,]+)', title)
+        match = re.search(r'[\$>]\s*([\d,.]+)', title)
         if match:
             threshold = float(match.group(1).replace(",", ""))
             return {"type": "above", "low": threshold, "high": 1e9}
-        above_match = re.search(r'\$?([\d,]+)\s+or\s+above', title_lower)
+        above_match = re.search(r'\$?([\d,.]+)\s+or\s+above', title_lower)
         if above_match:
             threshold = float(above_match.group(1).replace(",", ""))
             return {"type": "above", "low": threshold, "high": 1e9}
 
     # Pattern: "X or below" or "below $X"
     if "below" in title_lower or "<" in title:
-        match = re.search(r'[\$<]\s*([\d,]+)', title)
+        match = re.search(r'[\$<]\s*([\d,.]+)', title)
         if match:
             threshold = float(match.group(1).replace(",", ""))
             return {"type": "below", "low": 0, "high": threshold}
-        below_match = re.search(r'\$?([\d,]+)\s+or\s+below', title_lower)
+        below_match = re.search(r'\$?([\d,.]+)\s+or\s+below', title_lower)
         if below_match:
             threshold = float(below_match.group(1).replace(",", ""))
-            return {"type": "below", "low": 0, "high": threshold + 1}
+            return {"type": "below", "low": 0, "high": threshold + 0.01}
 
-    # Pattern: "$X to $Y" range
-    range_match = re.search(r'\$([\d,]+)\s*(?:to|-)\s*\$([\d,]+)', title)
+    # Pattern: "$X to $Y" range (supports decimals)
+    range_match = re.search(r'\$([\d,.]+)\s*(?:to|-)\s*\$([\d,.]+)', title)
     if range_match:
         low = float(range_match.group(1).replace(",", ""))
         high = float(range_match.group(2).replace(",", ""))
@@ -398,6 +399,7 @@ def parse_btc_bucket(ticker: str, title: str) -> Optional[dict]:
     if "-B" in ticker:
         try:
             center = float(ticker.split("-B")[-1])
+            # BTC buckets are $500 wide (center ± 250)
             return {"type": "bucket", "low": center - 250, "high": center + 250}
         except (ValueError, IndexError):
             pass

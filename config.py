@@ -38,7 +38,7 @@ def get_base_url() -> str:
 # ANTHROPIC (Claude AI)
 # =============================================================================
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # =============================================================================
 # RISK MANAGEMENT — SAFE DEFAULTS FOR $100 ACCOUNT
@@ -97,6 +97,26 @@ MAX_HOURS_TO_SETTLEMENT = 720  # 30 days — filter less aggressively to find ac
 AUTORESEARCH_MAX_ITERATIONS = int(os.getenv("AUTORESEARCH_MAX_ITERATIONS", "50"))
 AUTORESEARCH_TARGET_SHARPE = float(os.getenv("AUTORESEARCH_TARGET_SHARPE", "1.2"))
 AUTORESEARCH_MAX_DRAWDOWN = float(os.getenv("AUTORESEARCH_MAX_DRAWDOWN", "0.08"))
+
+# =============================================================================
+# KALSHI FEE FORMULA (from their docs)
+# =============================================================================
+# fee = ceil(rate * contracts * price * (1-price))
+# maker_rate = 0.0175, taker_rate = 0.07
+KALSHI_MAKER_FEE_RATE = 0.0175
+KALSHI_TAKER_FEE_RATE = 0.07
+
+def kalshi_fee_cents(contracts: int, price_cents: int, is_maker: bool = True) -> float:
+    """Calculate Kalshi fee in cents. Price in cents (1-99)."""
+    import math
+    rate = KALSHI_MAKER_FEE_RATE if is_maker else KALSHI_TAKER_FEE_RATE
+    p = price_cents / 100.0
+    return math.ceil(rate * contracts * p * (1 - p) * 100) / 100
+
+# Keep backward-compatible constants (approximate, for simple calculations)
+KALSHI_FEE_PER_SIDE_CENTS = 0.5  # avg maker fee at typical prices
+KALSHI_FEE_ROUND_TRIP_CENTS = 1.0
+KALSHI_FEE_PER_CONTRACT_DOLLARS = 0.01
 
 # =============================================================================
 # DISPLAY

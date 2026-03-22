@@ -49,7 +49,7 @@ console = Console()
 # CONSTANTS
 # =============================================================================
 KALSHI_BTC_SERIES = "KXBTC"
-BUCKET_WIDTH = 250  # $250 per bucket (BTC default)
+BUCKET_WIDTH = 500  # $500 per bucket (BTC default)
 SETTLEMENT_HOUR_EDT = 17  # 5 PM EDT = 21:00 UTC (or 22:00 during EST)
 MIN_EDGE_CENTS = 4  # Minimum edge to flag (in cents)
 
@@ -68,7 +68,7 @@ CRYPTO_ASSETS = {
         "coingecko_id": "bitcoin",
         "binance_symbol": "BTCUSDT",
         "default_annual_vol": 0.55,  # ~55% fallback
-        "bucket_width": 250,
+        "bucket_width": 500,  # BTC buckets are $500 wide (e.g. $87,000-$87,500)
         "name": "Bitcoin",
     },
     "ETH": {
@@ -77,7 +77,7 @@ CRYPTO_ASSETS = {
         "coingecko_id": "ethereum",
         "binance_symbol": "ETHUSDT",
         "default_annual_vol": 0.65,  # ~65% fallback
-        "bucket_width": 25,  # ETH buckets are narrower ($25)
+        "bucket_width": 20,  # ETH buckets are $20 wide (e.g. $2,190-$2,209.99)
         "name": "Ethereum",
     },
     "SOL": {
@@ -280,19 +280,20 @@ def _parse_crypto_bucket(ticker: str, title: str, asset: str = "BTC") -> Optiona
     if between_match:
         low = float(between_match.group(1).replace(",", ""))
         high = float(between_match.group(2).replace(",", ""))
-        return {"type": "bucket", "low": low, "high": high + 1}
+        # Kalshi "between $X and $Y" is inclusive; add small epsilon for exclusive upper
+        return {"type": "bucket", "low": low, "high": high + 0.01}
 
     # Try "X or above" pattern
     above_match = re.search(r'\$?([\d,.]+)\s+or\s+above', title_lower)
     if above_match:
         threshold = float(above_match.group(1).replace(",", ""))
-        return {"type": "above", "low": threshold, "high": threshold * 5}
+        return {"type": "above", "low": threshold, "high": 1e9}
 
     # Try "X or below" pattern
     below_match = re.search(r'\$?([\d,.]+)\s+or\s+below', title_lower)
     if below_match:
         threshold = float(below_match.group(1).replace(",", ""))
-        return {"type": "below", "low": 0, "high": threshold + 1}
+        return {"type": "below", "low": 0, "high": threshold + 0.01}
 
     # Try range: "$X to $Y" or "$X - $Y"
     range_match = re.search(r'\$([\d,.]+)\s*(?:to|-)\s*\$([\d,.]+)', title)
@@ -306,15 +307,15 @@ def _parse_crypto_bucket(ticker: str, title: str, asset: str = "BTC") -> Optiona
         match = re.search(r'[\$>]\s*([\d,.]+)', title)
         if match:
             threshold = float(match.group(1).replace(",", ""))
-            return {"type": "above", "low": threshold, "high": threshold * 5}
+            return {"type": "above", "low": threshold, "high": 1e9}
 
     if "below" in title_lower or "<" in title:
         match = re.search(r'[\$<]\s*([\d,.]+)', title)
         if match:
             threshold = float(match.group(1).replace(",", ""))
-            return {"type": "below", "low": 0, "high": threshold + 1}
+            return {"type": "below", "low": 0, "high": threshold}
 
-    # Fallback: parse from ticker
+    # Fallback: parse from ticker with asset-specific bucket widths
     cfg = CRYPTO_ASSETS.get(asset, CRYPTO_ASSETS["BTC"])
     bucket_width = cfg["bucket_width"]
 
@@ -330,11 +331,11 @@ def _parse_crypto_bucket(ticker: str, title: str, asset: str = "BTC") -> Optiona
         try:
             threshold = float(ticker.split("-T")[-1])
             if "above" in title_lower or "higher" in title_lower:
-                return {"type": "above", "low": threshold, "high": threshold * 5}
+                return {"type": "above", "low": threshold, "high": 1e9}
             elif "below" in title_lower or "lower" in title_lower:
                 return {"type": "below", "low": 0, "high": threshold}
             else:
-                return {"type": "above", "low": threshold, "high": threshold * 5}
+                return {"type": "above", "low": threshold, "high": 1e9}
         except (ValueError, IndexError):
             pass
 
@@ -762,65 +763,9 @@ def calc_bucket_probability(
 def _parse_btc_bucket(ticker: str, title: str) -> Optional[dict]:
     """
     Parse a BTC market ticker/title to extract bucket bounds.
-
-    Kalshi BTC tickers look like:
-        KXBTC-26MAR21-T87500   (above/below threshold)
-        KXBTC-26MAR21-B87250   (bucket centered at 87250, so 87125-87375)
-    Titles look like:
-        "Will Bitcoin be between $87,000 and $87,249?"
-        "Will Bitcoin be $87,250 or above?"
-        "Will Bitcoin be $86,749 or below?"
+    Delegates to _parse_crypto_bucket with asset="BTC".
     """
-    import re
-
-    title_lower = title.lower()
-
-    # Try "between $X and $Y" pattern
-    between_match = re.search(
-        r'between\s+\$?([\d,]+)\s+and\s+\$?([\d,]+)', title_lower
-    )
-    if between_match:
-        low = float(between_match.group(1).replace(",", ""))
-        high = float(between_match.group(2).replace(",", ""))
-        # Kalshi uses inclusive ranges like "$87,000 and $87,249"
-        # The actual boundary is high + 1 (i.e., 87,250)
-        return {"type": "bucket", "low": low, "high": high + 1}
-
-    # Try "X or above" pattern
-    above_match = re.search(r'\$?([\d,]+)\s+or\s+above', title_lower)
-    if above_match:
-        threshold = float(above_match.group(1).replace(",", ""))
-        return {"type": "above", "low": threshold, "high": threshold * 5}
-
-    # Try "X or below" pattern
-    below_match = re.search(r'\$?([\d,]+)\s+or\s+below', title_lower)
-    if below_match:
-        threshold = float(below_match.group(1).replace(",", ""))
-        return {"type": "below", "low": 0, "high": threshold + 1}
-
-    # Fallback: parse from ticker
-    if "-B" in ticker:
-        try:
-            center = float(ticker.split("-B")[-1])
-            half = BUCKET_WIDTH / 2
-            return {"type": "bucket", "low": center - half, "high": center + half}
-        except (ValueError, IndexError):
-            pass
-
-    if "-T" in ticker:
-        try:
-            threshold = float(ticker.split("-T")[-1])
-            if "above" in title_lower or "higher" in title_lower:
-                return {"type": "above", "low": threshold, "high": threshold * 5}
-            elif "below" in title_lower or "lower" in title_lower:
-                return {"type": "below", "low": 0, "high": threshold}
-            else:
-                # Default: treat as above threshold
-                return {"type": "above", "low": threshold, "high": threshold * 5}
-        except (ValueError, IndexError):
-            pass
-
-    return None
+    return _parse_crypto_bucket(ticker, title, asset="BTC")
 
 
 # =============================================================================

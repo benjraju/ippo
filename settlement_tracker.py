@@ -970,64 +970,7 @@ class SettlementTracker:
         console.print(f"\n[green]All outputs saved to: {config.OUTPUT_DIR}[/green]")
         console.print(f"[green]AutoResearch data: {self.real_outcomes_path}[/green]")
 
-        # Trigger a quick research burst if new settlements were detected.
-        # This runs *after* save_real_outcomes() so the loop trains on the
-        # freshest data.  The trigger is a no-op if research is already running.
-        self._trigger_post_settlement_research(records)
-
         return summary
-
-    def _trigger_post_settlement_research(self, records: list) -> None:
-        """
-        Spawn a short AutoResearch run when new settlements have accumulated
-        since the last trigger.
-
-        Uses a persistent state file (autoresearch/settlement_trigger_state.json)
-        to track how many trades were settled at the time of the last trigger.
-        If the current count is higher, new settlements occurred and research
-        is kicked off.  If research is already running the call is a no-op.
-        """
-        try:
-            from autoresearch.post_settlement_research import (
-                get_last_trigger_settled_count,
-                trigger_post_settlement_research,
-            )
-
-            settled_total = sum(
-                1 for r in records if r.settlement_result != "open"
-            )
-            last_count = get_last_trigger_settled_count()
-            new_count = settled_total - last_count
-
-            if new_count <= 0:
-                return
-
-            # Pick the research strategy based on what settled.
-            # Weather is the only loop implemented today; sports/btc fall
-            # through to the 'other' stub and are logged but not run.
-            any_weather = any(
-                r.strategy == "weather" and r.settlement_result != "open"
-                for r in records
-            )
-            strategy = "weather" if any_weather else "other"
-
-            triggered = trigger_post_settlement_research(
-                new_settlement_count=new_count,
-                settled_total=settled_total,
-                strategy=strategy,
-            )
-            if triggered:
-                console.print(
-                    f"[cyan]Post-settlement research started: "
-                    f"{new_count} new settlement(s) → running 15 iterations "
-                    f"with real data...[/cyan]"
-                )
-
-        except Exception as exc:
-            # Never let a trigger failure break the settlement report.
-            console.print(
-                f"[yellow]Post-settlement research trigger skipped: {exc}[/yellow]"
-            )
 
 
 # ---------------------------------------------------------------------------

@@ -193,6 +193,121 @@ def setup_logger(dry_run: bool = True) -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic strategy parameter loading
+# ---------------------------------------------------------------------------
+
+def load_strategy_params():
+    """Load evolved parameters from candidate_strategy.py, with safe defaults.
+
+    Returns a dict with ALL tunable params. auto_trade.py should use these
+    instead of its own hardcoded constants so that AutoResearch mutations
+    actually take effect in live trading.
+    """
+    try:
+        import importlib
+        # Force reimport to get latest values
+        for mod in list(sys.modules.keys()):
+            if "candidate_strategy" in mod:
+                del sys.modules[mod]
+        from autoresearch.candidate_strategy import (
+            EDGE_THRESHOLD_CENTS,
+            CONTRACTS_PER_TRADE,
+            NWS_OFFICIAL_WEIGHT,
+            MAX_POSITION_DOLLARS,
+            MIN_VOLUME,
+            BUCKET_MULTIPLIER,
+            THRESHOLD_MULTIPLIER,
+            HIGH_CONFIDENCE_EDGE,
+            MEDIUM_CONFIDENCE_EDGE,
+            TIGHT_ENSEMBLE_THRESHOLD,
+            TIGHT_ENSEMBLE_MULTIPLIER,
+            CRYPTO_EDGE_THRESHOLD_CENTS as _CRYPTO_EDGE,
+            SPORTS_EDGE_THRESHOLD_CENTS as _SPORTS_EDGE,
+            ARB_EDGE_THRESHOLD_CENTS as _ARB_EDGE,
+            EXIT_EDGE_THRESHOLD_CENTS as _EXIT_EDGE,
+            TAIL_FADE_MAX_PRICE,
+            TAIL_FADE_MIN_VOLUME,
+            TAIL_FADE_WEATHER_ENABLED,
+            TAIL_FADE_CRYPTO_ENABLED,
+            TAIL_FADE_NBA_ENABLED,
+            TAIL_FADE_MID_LOW,
+            TAIL_FADE_MID_HIGH,
+            get_city_weights,
+            get_forecast_stdev,
+            get_blend_weights,
+        )
+        return {
+            # Weather edge & sizing
+            "edge_threshold": EDGE_THRESHOLD_CENTS,
+            "contracts_per_trade": CONTRACTS_PER_TRADE,
+            "nws_weight": NWS_OFFICIAL_WEIGHT,
+            "max_position": MAX_POSITION_DOLLARS,
+            "min_volume": MIN_VOLUME,
+            "city_weights": get_city_weights(),
+            "forecast_stdev": get_forecast_stdev(),
+            # Market type multipliers
+            "bucket_multiplier": BUCKET_MULTIPLIER,
+            "threshold_multiplier": THRESHOLD_MULTIPLIER,
+            # Confidence tiers
+            "high_confidence_edge": HIGH_CONFIDENCE_EDGE,
+            "medium_confidence_edge": MEDIUM_CONFIDENCE_EDGE,
+            # Ensemble tightness
+            "tight_ensemble_threshold": TIGHT_ENSEMBLE_THRESHOLD,
+            "tight_ensemble_multiplier": TIGHT_ENSEMBLE_MULTIPLIER,
+            # Per-strategy edge thresholds
+            "crypto_edge_threshold": _CRYPTO_EDGE,
+            "sports_edge_threshold": _SPORTS_EDGE,
+            "arb_edge_threshold": _ARB_EDGE,
+            "exit_edge_threshold": _EXIT_EDGE,
+            # Blend weights
+            "blend_weights": get_blend_weights(),
+            # Tail fade params
+            "tail_fade_max_price": TAIL_FADE_MAX_PRICE,
+            "tail_fade_min_volume": TAIL_FADE_MIN_VOLUME,
+            "tail_fade_weather_enabled": TAIL_FADE_WEATHER_ENABLED,
+            "tail_fade_crypto_enabled": TAIL_FADE_CRYPTO_ENABLED,
+            "tail_fade_nba_enabled": TAIL_FADE_NBA_ENABLED,
+            "tail_fade_mid_low": TAIL_FADE_MID_LOW,
+            "tail_fade_mid_high": TAIL_FADE_MID_HIGH,
+        }
+    except Exception:
+        return {
+            # Weather edge & sizing
+            "edge_threshold": WEATHER_EDGE_THRESHOLD_CENTS,
+            "contracts_per_trade": 10,
+            "nws_weight": 0.40,
+            "max_position": MAX_DOLLARS_PER_TRADE,
+            "min_volume": 10,
+            "city_weights": {"NYC": 1.0, "Chicago": 0.8, "Miami": 1.0, "LA": 1.0, "DC": 1.0, "Denver": 1.0},
+            "forecast_stdev": {0: 1.5, 1: 2.5, 2: 3.5, 3: 4.5},
+            # Market type multipliers
+            "bucket_multiplier": 1.0,
+            "threshold_multiplier": 1.0,
+            # Confidence tiers
+            "high_confidence_edge": 7.0,
+            "medium_confidence_edge": 5.0,
+            # Ensemble tightness
+            "tight_ensemble_threshold": 2.0,
+            "tight_ensemble_multiplier": 1.5,
+            # Per-strategy edge thresholds
+            "crypto_edge_threshold": BTC_EDGE_THRESHOLD_CENTS,
+            "sports_edge_threshold": SPORTS_EDGE_THRESHOLD_CENTS,
+            "arb_edge_threshold": ARB_EDGE_THRESHOLD_CENTS,
+            "exit_edge_threshold": EXIT_EDGE_THRESHOLD_CENTS,
+            # Blend weights
+            "blend_weights": dict(BLEND_WEIGHTS),
+            # Tail fade params (safe defaults)
+            "tail_fade_max_price": 5,
+            "tail_fade_min_volume": 0,
+            "tail_fade_weather_enabled": 1,
+            "tail_fade_crypto_enabled": 1,
+            "tail_fade_nba_enabled": 1,
+            "tail_fade_mid_low": 30,
+            "tail_fade_mid_high": 50,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Data classes for trade decisions
 # ---------------------------------------------------------------------------
 
@@ -363,6 +478,7 @@ def fetch_hrrr_forecast(series_ticker: str, logger: logging.Logger) -> dict:
 def blend_forecasts(
     nws: dict, ensemble: dict, logger: logging.Logger,
     hrrr: dict | None = None,
+    strategy: dict | None = None,
 ) -> dict:
     """
     Blend NWS official + GFS ensemble + HRRR for each date.
@@ -376,9 +492,17 @@ def blend_forecasts(
     If HRRR is unavailable, falls back to GFS+NWS blend with legacy weights.
     Stdev: use ensemble stdev (data-driven, not hardcoded).
     Fallback: if only one source available, use it with default stdev.
+
+    If strategy dict is provided, uses evolved blend_weights and forecast_stdev
+    from candidate_strategy.py instead of hardcoded module-level constants.
     """
     if hrrr is None:
         hrrr = {}
+
+    # Use evolved blend weights from strategy if available, else module-level constants
+    blend_wts = (strategy or {}).get("blend_weights", BLEND_WEIGHTS)
+    # Use evolved forecast stdev from strategy for fallback when ensemble unavailable
+    fallback_stdev = (strategy or {}).get("forecast_stdev", {0: 1.5, 1: 2.5, 2: 3.5, 3: 4.5})
 
     all_dates = set(list(nws.keys()) + list(ensemble.keys()) + list(hrrr.keys()))
     result = {}
@@ -396,15 +520,15 @@ def blend_forecasts(
         except Exception:
             days_out = 1
 
-        # Determine stdev (prefer ensemble-derived, fall back to hardcoded)
+        # Determine stdev (prefer ensemble-derived, fall back to evolved strategy values)
         if ens_data is not None:
             stdev = ens_data["stdev"]
         else:
-            stdev = {0: 1.5, 1: 2.5, 2: 3.5, 3: 4.5}.get(min(days_out, 3), 4.0)
+            stdev = fallback_stdev.get(min(days_out, 3), 4.0)
 
         # Use HRRR-aware blending when we have HRRR data for day 0 or 1
         if hrrr_data is not None and days_out <= 1:
-            weights = BLEND_WEIGHTS.get(days_out, BLEND_WEIGHTS[2])
+            weights = blend_wts.get(days_out, blend_wts.get(2, BLEND_WEIGHTS[2]))
             sources = []
             weighted_sum = 0.0
             total_weight = 0.0
@@ -433,7 +557,7 @@ def blend_forecasts(
                 continue
         elif nws_temp is not None and ens_data is not None:
             # Legacy blend: GFS + NWS (no HRRR)
-            weights = BLEND_WEIGHTS.get(min(days_out, 2), BLEND_WEIGHTS[2])
+            weights = blend_wts.get(min(days_out, 2), blend_wts.get(2, BLEND_WEIGHTS[2]))
             blended = weights["nws"] * nws_temp + weights["gfs"] * ens_data["mean"]
             # Normalize since hrrr weight is 0 for day 2+ but we want gfs+nws to sum to 1
             total_w = weights["nws"] + weights["gfs"]
@@ -674,13 +798,109 @@ def fetch_crypto_30d_vol(asset: str, logger: logging.Logger) -> Optional[float]:
         return None
 
 
-def parse_crypto_bucket(ticker: str, title: str) -> Optional[dict]:
+def parse_bucket_from_title(title: str) -> Optional[dict]:
+    """
+    Parse actual bucket bounds from a Kalshi market title.
+    Handles all crypto assets (BTC, ETH, SOL) with decimal support.
+
+    Title formats:
+        "Will Bitcoin be between $87,000 and $87,249?"
+        "Will Ether be between $2,190.00 and $2,209.99?"
+        "Will Solana be between $140.00 and $141.99?"
+        "Bitcoin above $87,500?"  /  "$87,250 or above"
+        "$2,190 to $2,209.99"
+    """
+    title_lower = title.lower()
+
+    # Pattern 1: "between $X and $Y"
+    between_match = re.search(
+        r'between\s+\$?([\d,.]+)\s+and\s+\$?([\d,.]+)', title_lower
+    )
+    if between_match:
+        low = float(between_match.group(1).replace(",", ""))
+        high = float(between_match.group(2).replace(",", ""))
+        # Kalshi "between $X and $Y" means [X, Y], add 1 unit for exclusive upper
+        return {"type": "bucket", "low": low, "high": high + 0.01}
+
+    # Pattern 2: "X or above"
+    above_or_match = re.search(r'\$?([\d,.]+)\s+or\s+above', title_lower)
+    if above_or_match:
+        threshold = float(above_or_match.group(1).replace(",", ""))
+        return {"type": "above", "low": threshold, "high": 1e9}
+
+    # Pattern 3: "above $X" or "> $X"
+    if "above" in title_lower or ">" in title:
+        match = re.search(r'[\$>]\s*([\d,.]+)', title)
+        if match:
+            threshold = float(match.group(1).replace(",", ""))
+            return {"type": "above", "low": threshold, "high": 1e9}
+
+    # Pattern 4: "X or below"
+    below_or_match = re.search(r'\$?([\d,.]+)\s+or\s+below', title_lower)
+    if below_or_match:
+        threshold = float(below_or_match.group(1).replace(",", ""))
+        return {"type": "below", "low": 0, "high": threshold + 0.01}
+
+    # Pattern 5: "below $X" or "< $X"
+    if "below" in title_lower or "<" in title:
+        match = re.search(r'[\$<]\s*([\d,.]+)', title)
+        if match:
+            threshold = float(match.group(1).replace(",", ""))
+            return {"type": "below", "low": 0, "high": threshold}
+
+    # Pattern 6: "$X to $Y" or "$X - $Y" (with decimal support)
+    range_match = re.search(r'\$([\d,.]+)\s*(?:to|-)\s*\$([\d,.]+)', title)
+    if range_match:
+        low = float(range_match.group(1).replace(",", ""))
+        high = float(range_match.group(2).replace(",", ""))
+        return {"type": "bucket", "low": low, "high": high}
+
+    return None
+
+
+# Asset-specific half-widths for ticker-based fallback parsing.
+# These are HALF the bucket width: BTC=$500 -> ±250, ETH=$20 -> ±10, SOL=$2 -> ±1
+CRYPTO_BUCKET_HALF_WIDTHS = {
+    "BTC": 250,
+    "ETH": 10,
+    "SOL": 1,
+}
+
+
+def parse_crypto_bucket(ticker: str, title: str, asset: str = "BTC") -> Optional[dict]:
     """
     Parse crypto market ticker/title to extract bucket bounds.
-    Works for BTC, ETH, SOL -- all use similar title patterns on Kalshi.
+    Works for BTC, ETH, SOL with asset-specific bucket widths.
+
+    Prefers title-based parsing (exact bounds) over ticker-based inference.
     """
-    # Reuse parse_btc_bucket -- same patterns work for all crypto
-    return parse_btc_bucket(ticker, title)
+    # First, try parsing exact bounds from the market title
+    result = parse_bucket_from_title(title)
+    if result:
+        return result
+
+    # Fallback: parse from ticker with asset-specific bucket widths
+    half_width = CRYPTO_BUCKET_HALF_WIDTHS.get(asset, 250)
+
+    if "-T" in ticker:
+        try:
+            threshold = float(ticker.split("-T")[-1])
+            title_lower = title.lower()
+            if "above" in title_lower or ">" in title_lower:
+                return {"type": "above", "low": threshold, "high": 1e9}
+            else:
+                return {"type": "below", "low": 0, "high": threshold}
+        except (ValueError, IndexError):
+            pass
+
+    if "-B" in ticker:
+        try:
+            center = float(ticker.split("-B")[-1])
+            return {"type": "bucket", "low": center - half_width, "high": center + half_width}
+        except (ValueError, IndexError):
+            pass
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -729,49 +949,11 @@ def parse_btc_bucket(ticker: str, title: str) -> Optional[dict]:
     Parse BTC market ticker/title to extract bucket bounds.
     BTC tickers look like: KXBTC-26MAR20-T87500 or KXBTC-26MAR20-B87250
     Titles like: "Bitcoin above $87,500?" or "Bitcoin $87,000 to $87,500?"
+
+    NOTE: For multi-asset crypto parsing, prefer parse_crypto_bucket(ticker, title, asset).
+    This function is kept for backward compatibility and defaults to BTC bucket widths.
     """
-    title_lower = title.lower()
-
-    # Above/below threshold
-    if "above" in title_lower or ">" in title:
-        match = re.search(r'[\$>]\s*([\d,]+)', title)
-        if match:
-            threshold = float(match.group(1).replace(",", ""))
-            return {"type": "above", "low": threshold, "high": 1e9}
-
-    if "below" in title_lower or "<" in title:
-        match = re.search(r'[\$<]\s*([\d,]+)', title)
-        if match:
-            threshold = float(match.group(1).replace(",", ""))
-            return {"type": "below", "low": 0, "high": threshold}
-
-    # Range bucket: "$87,000 to $87,500" or "87000-87500"
-    match = re.search(r'\$([\d,]+)\s*(?:to|-)\s*\$([\d,]+)', title)
-    if match:
-        low = float(match.group(1).replace(",", ""))
-        high = float(match.group(2).replace(",", ""))
-        return {"type": "bucket", "low": low, "high": high}
-
-    # Fallback: parse from ticker
-    if "-T" in ticker:
-        try:
-            threshold = float(ticker.split("-T")[-1])
-            if "above" in title_lower or ">" in title_lower:
-                return {"type": "above", "low": threshold, "high": 1e9}
-            else:
-                return {"type": "below", "low": 0, "high": threshold}
-        except (ValueError, IndexError):
-            pass
-
-    if "-B" in ticker:
-        try:
-            center = float(ticker.split("-B")[-1])
-            # BTC buckets are typically $500 wide
-            return {"type": "bucket", "low": center - 250, "high": center + 250}
-        except (ValueError, IndexError):
-            pass
-
-    return None
+    return parse_crypto_bucket(ticker, title, asset="BTC")
 
 
 # ---------------------------------------------------------------------------
@@ -863,6 +1045,11 @@ def run_weather_session(
     logger.info("--- WEATHER SESSION START ---")
     decisions = []
 
+    # Load evolved strategy parameters from candidate_strategy.py
+    strategy = load_strategy_params()
+    logger.info(f"Strategy params: edge_threshold={strategy['edge_threshold']}c, "
+                f"nws_weight={strategy['nws_weight']}, max_pos=${strategy['max_position']}")
+
     # Calculate deployment cap
     max_deploy = balance * MAX_DAILY_DEPLOY_PCT
     deployed_so_far = 0.0
@@ -889,7 +1076,7 @@ def run_weather_session(
             continue
 
         # 4. Blend forecasts (HRRR + GFS + NWS with day-dependent weights)
-        blended = blend_forecasts(nws, ensemble, logger, hrrr=hrrr)
+        blended = blend_forecasts(nws, ensemble, logger, hrrr=hrrr, strategy=strategy)
         for date_str, fc in blended.items():
             logger.info(
                 f"  {date_str}: blended={fc['temp']:.1f}F stdev={fc['stdev']:.2f} "
@@ -955,12 +1142,12 @@ def run_weather_session(
             buy_yes_edge = fair_cents - buy_yes_price
             buy_no_edge = (100 - fair_cents) - buy_no_price
 
-            # Choose best side
-            if buy_yes_edge >= WEATHER_EDGE_THRESHOLD_CENTS and buy_yes_edge >= buy_no_edge:
+            # Choose best side (using evolved edge threshold from candidate_strategy)
+            if buy_yes_edge >= strategy["edge_threshold"] and buy_yes_edge >= buy_no_edge:
                 side = "yes"
                 edge = buy_yes_edge
                 price_cents = int(math.ceil(buy_yes_price))
-            elif buy_no_edge >= WEATHER_EDGE_THRESHOLD_CENTS:
+            elif buy_no_edge >= strategy["edge_threshold"]:
                 side = "no"
                 edge = buy_no_edge
                 price_cents = int(math.ceil(buy_no_price))
@@ -976,10 +1163,10 @@ def run_weather_session(
             # Clamp price to valid range
             price_cents = max(1, min(99, price_cents))
 
-            # Position sizing: $1-2 per trade
+            # Position sizing: use evolved max_position from candidate_strategy
             cost_per_contract = price_cents / 100.0
             max_dollars = min(
-                MAX_DOLLARS_PER_TRADE,
+                strategy["max_position"],
                 max_deploy - deployed_so_far,
                 daily_loss_cap,
             )
@@ -1103,10 +1290,22 @@ def run_crypto_session(
     Crypto trading session -- loops over BTC, ETH, SOL (or specified assets).
     Prices buckets using log-normal model for each asset with asset-specific vol.
     """
+    # FORCE DRY-RUN for crypto until bucket parsing is fixed and validated.
+    # The crypto bucket parser (parse_crypto_bucket) was broken as of 2026-03-22,
+    # producing incorrect bucket boundaries. Trading with bad bucket probabilities
+    # would cause systematic losses. Remove this override once the fix is validated.
+    if not dry_run:
+        logger.warning("CRYPTO FORCED TO DRY-RUN: bucket parsing not yet validated")
+        dry_run = True
+
     if assets is None:
         assets = list(CRYPTO_ASSETS.keys())  # ["BTC", "ETH", "SOL"]
 
-    logger.info(f"--- CRYPTO SESSION START (assets: {', '.join(assets)}) ---")
+    # Load evolved strategy parameters from candidate_strategy.py
+    strategy = load_strategy_params()
+    crypto_edge_threshold = strategy["crypto_edge_threshold"]
+
+    logger.info(f"--- CRYPTO SESSION START (assets: {', '.join(assets)}) | edge_threshold={crypto_edge_threshold}c ---")
     all_decisions = []
 
     for asset in assets:
@@ -1158,8 +1357,8 @@ def run_crypto_session(
             if yes_bid <= 0 and yes_ask <= 1:
                 continue
 
-            # Parse bucket
-            bucket = parse_crypto_bucket(ticker, title)
+            # Parse bucket (pass asset for correct bucket widths)
+            bucket = parse_crypto_bucket(ticker, title, asset)
             if not bucket:
                 continue
 
@@ -1191,11 +1390,11 @@ def run_crypto_session(
             buy_no_edge = no_fair - no_ask_price
             buy_yes_edge = fair_cents - yes_ask if yes_ask > 0 else 0
 
-            if buy_no_edge >= BTC_EDGE_THRESHOLD_CENTS:
+            if buy_no_edge >= crypto_edge_threshold:
                 side = "no"
                 edge = buy_no_edge
                 price_cents = int(math.ceil(no_ask_price))
-            elif buy_yes_edge >= BTC_EDGE_THRESHOLD_CENTS:
+            elif buy_yes_edge >= crypto_edge_threshold:
                 side = "yes"
                 edge = buy_yes_edge
                 price_cents = int(math.ceil(yes_ask))
@@ -1325,6 +1524,10 @@ def run_sports_session(
     logger.info("--- SPORTS SESSION START ---")
     decisions = []
 
+    # Load evolved strategy parameters from candidate_strategy.py
+    strategy = load_strategy_params()
+    sports_edge_threshold = strategy["sports_edge_threshold"]
+
     if find_nba_edges is None:
         logger.warning("sports_strategy not available, skipping sports session")
         logger.info("--- SPORTS SESSION DONE: 0 decisions, 0 trades ---")
@@ -1343,7 +1546,35 @@ def run_sports_session(
         logger.info("--- SPORTS SESSION DONE: 0 decisions, 0 trades ---")
         return decisions
 
-    logger.info(f"Found {len(edges)} NBA edges")
+    logger.info(f"Found {len(edges)} NBA edges | edge_threshold={sports_edge_threshold}c")
+
+    # ---- UNDERDOG FILTER (2026-03-22) ----
+    # Data shows: underdogs (<30c) have 48% win rate with 6:1 payoff.
+    # Mid-range and favorites LOSE money. Only trade Winner markets where
+    # the market price < 30c (i.e. underdogs).
+    pre_filter_count = len(edges)
+    filtered_edges = []
+    for e in edges:
+        # Only trade "Winner" markets (skip Total Points, Spreads, props).
+        # The sports_strategy already only returns game winner edges, but
+        # double-check by filtering out anything with spread/total/points keywords.
+        title_lower = (e.title or "").lower()
+        if any(kw in title_lower for kw in ["total", "spread", "points", "over", "under", "prop"]):
+            logger.debug(f"  SKIP (not winner market): {e.ticker} | {e.title}")
+            continue
+        # Only buy YES when market price < 30c (underdogs).
+        # For buy_no edges, the market_price is the YES price, so the NO side
+        # cost is (100 - market_price). We want the price WE pay to be < 30c.
+        if e.side == "buy_yes" and e.market_price >= 30:
+            logger.debug(f"  SKIP (not underdog, yes@{e.market_price:.0f}c): {e.ticker}")
+            continue
+        if e.side == "buy_no" and (100 - e.market_price) >= 30:
+            logger.debug(f"  SKIP (not underdog, no@{100 - e.market_price:.0f}c): {e.ticker}")
+            continue
+        filtered_edges.append(e)
+    edges = filtered_edges
+    logger.info(f"After underdog filter (<30c): {len(edges)}/{pre_filter_count} edges remain")
+    # ---- END UNDERDOG FILTER ----
 
     trades_placed = 0
     daily_loss_cap = balance * DAILY_LOSS_CAP_PCT
@@ -1353,8 +1584,8 @@ def run_sports_session(
             logger.info(f"Sports trade cap reached ({MAX_SPORTS_TRADES_PER_DAY})")
             break
 
-        # Only trade edges above threshold
-        if edge_obj.edge < SPORTS_EDGE_THRESHOLD_CENTS:
+        # Only trade edges above threshold (evolved from candidate_strategy)
+        if edge_obj.edge < sports_edge_threshold:
             continue
 
         ticker = edge_obj.ticker
@@ -1462,6 +1693,10 @@ def run_arb_session(
     logger.info("--- ARB SESSION START ---")
     decisions = []
 
+    # Load evolved strategy parameters from candidate_strategy.py
+    strategy = load_strategy_params()
+    arb_edge_threshold = strategy["arb_edge_threshold"]
+
     if ArbScanner is None:
         logger.warning("arb_scanner not available, skipping arb session")
         logger.info("--- ARB SESSION DONE: 0 decisions, 0 trades ---")
@@ -1483,7 +1718,7 @@ def run_arb_session(
         logger.info("--- ARB SESSION DONE: 0 decisions, 0 trades ---")
         return decisions
 
-    logger.info(f"Found {len(opps)} arb opportunities")
+    logger.info(f"Found {len(opps)} arb opportunities | edge_threshold={arb_edge_threshold}c")
 
     trades_placed = 0
     daily_loss_cap = balance * DAILY_LOSS_CAP_PCT
@@ -1493,8 +1728,8 @@ def run_arb_session(
             logger.info(f"Arb trade cap reached ({MAX_ARB_TRADES_PER_DAY})")
             break
 
-        # Only trade high-confidence, high-edge opportunities
-        if opp.edge_cents < ARB_EDGE_THRESHOLD_CENTS:
+        # Only trade high-confidence, high-edge opportunities (evolved from candidate_strategy)
+        if opp.edge_cents < arb_edge_threshold:
             continue
         if opp.confidence < 0.6:
             logger.debug(f"  SKIP ARB {opp.ticker}: low confidence {opp.confidence:.0%}")
@@ -1652,6 +1887,10 @@ def check_exits(
     logger.info("--- EXIT CHECK START ---")
     exit_decisions = []
 
+    # Load evolved strategy params (for blend weights, stdev fallback, exit threshold)
+    strategy = load_strategy_params()
+    exit_threshold = strategy["exit_edge_threshold"]
+
     try:
         positions = client.get_positions()
         market_positions = positions.get("market_positions", [])
@@ -1689,7 +1928,7 @@ def check_exits(
         if series_ticker not in forecast_cache:
             nws = fetch_nws_forecast(series_ticker, logger)
             ensemble = fetch_ensemble_forecast(series_ticker, logger)
-            forecast_cache[series_ticker] = blend_forecasts(nws, ensemble, logger)
+            forecast_cache[series_ticker] = blend_forecasts(nws, ensemble, logger, strategy=strategy)
 
     for mp in weather_positions:
         ticker = mp["ticker"]
@@ -1763,7 +2002,7 @@ def check_exits(
             current_edge = (100 - fair_cents) - no_bid if no_bid > 0 else (100 - fair_cents)
 
         # Check if edge has evaporated or flipped
-        should_exit = current_edge < EXIT_EDGE_THRESHOLD_CENTS
+        should_exit = current_edge < exit_threshold
 
         if not should_exit:
             logger.debug(
@@ -1788,7 +2027,7 @@ def check_exits(
             reason=(
                 f"EXIT {city} {market_date} | forecast={forecast_temp:.1f}F "
                 f"stdev={stdev:.2f} | fair={fair_cents:.1f}c "
-                f"edge={current_edge:+.1f}c (below {EXIT_EDGE_THRESHOLD_CENTS}c threshold)"
+                f"edge={current_edge:+.1f}c (below {exit_threshold}c threshold)"
             ),
             forecast_temp=round(forecast_temp, 1),
         )
@@ -1841,6 +2080,345 @@ def check_exits(
 
 
 # ---------------------------------------------------------------------------
+# Tail Fade session (Strategy 1)
+# ---------------------------------------------------------------------------
+
+# Series tickers to scan for tail fade opportunities
+TAIL_FADE_SERIES = {
+    "weather": ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLA", "KXHIGHDC", "KXHIGHDEN"],
+    "crypto":  ["KXBTC", "KXETH", "KXSOL"],
+    "nba":     ["KXNBA", "KXNBAGAME"],
+}
+
+MAX_TAIL_FADE_TRADES = 10  # cap per session
+
+
+def run_tail_fade_session(
+    client: KalshiClient,
+    balance: float,
+    dry_run: bool,
+    logger: logging.Logger,
+) -> list[TradeDecision]:
+    """
+    Tail Fade session -- buy NO on extreme tails and mid-range overpriced YES.
+
+    Strategy:
+      - YES <= TAIL_FADE_MAX_PRICE (e.g. 5c): buy NO @ (100 - yes_ask) -- fade the tail
+      - YES in [MID_LOW, MID_HIGH] (e.g. 30-50c): buy NO @ (100 - yes_ask) -- fade mid-range
+    All orders are post_only limit orders, max $2 per trade.
+    """
+    logger.info("--- TAIL FADE SESSION START ---")
+    decisions = []
+
+    strategy = load_strategy_params()
+    max_price = strategy["tail_fade_max_price"]
+    mid_low = strategy["tail_fade_mid_low"]
+    mid_high = strategy["tail_fade_mid_high"]
+    weather_on = strategy["tail_fade_weather_enabled"]
+    crypto_on = strategy["tail_fade_crypto_enabled"]
+    nba_on = strategy["tail_fade_nba_enabled"]
+
+    logger.info(
+        f"  Params: tail_max={max_price}c mid=[{mid_low}-{mid_high}]c "
+        f"weather={'ON' if weather_on else 'OFF'} crypto={'ON' if crypto_on else 'OFF'} "
+        f"nba={'ON' if nba_on else 'OFF'}"
+    )
+
+    # Build list of series to scan
+    series_to_scan = []
+    if weather_on:
+        series_to_scan.extend(TAIL_FADE_SERIES["weather"])
+    if crypto_on:
+        series_to_scan.extend(TAIL_FADE_SERIES["crypto"])
+    if nba_on:
+        series_to_scan.extend(TAIL_FADE_SERIES["nba"])
+
+    if not series_to_scan:
+        logger.info("  All categories disabled, nothing to scan")
+        logger.info("--- TAIL FADE SESSION DONE: 0 decisions, 0 trades ---")
+        return decisions
+
+    trades_placed = 0
+
+    for series_ticker in series_to_scan:
+        if trades_placed >= MAX_TAIL_FADE_TRADES:
+            break
+
+        # Fetch open markets for this series
+        try:
+            resp = client.get_markets(series_ticker=series_ticker, status="open", limit=100)
+            markets = resp.get("markets", [])
+        except Exception as e:
+            logger.warning(f"  Failed to fetch markets for {series_ticker}: {e}")
+            continue
+
+        for mkt in markets:
+            if trades_placed >= MAX_TAIL_FADE_TRADES:
+                break
+
+            ticker = mkt.get("ticker", "")
+            yes_bid = float(mkt.get("yes_bid", 0) or 0)
+            yes_ask = float(mkt.get("yes_ask", 0) or 0)
+            volume = int(mkt.get("volume", 0) or 0)
+
+            # Kalshi API returns prices in cents (integer) on some endpoints,
+            # dollars on others. Normalize: if < 1.0, it's dollars -> convert.
+            if 0 < yes_bid < 1.0:
+                yes_bid = yes_bid * 100
+            if 0 < yes_ask < 1.0:
+                yes_ask = yes_ask * 100
+
+            # Skip dead markets
+            if yes_ask <= 0:
+                continue
+
+            # Determine fade zone
+            fade_zone = None
+            if yes_ask <= max_price:
+                fade_zone = "tail"
+            elif mid_low <= yes_ask <= mid_high:
+                fade_zone = "mid"
+            else:
+                continue
+
+            # NO price = 100 - yes_ask
+            no_price_cents = int(100 - yes_ask)
+            if no_price_cents < 1 or no_price_cents > 99:
+                continue
+
+            # Size: max $2 per trade
+            cost_per_contract = no_price_cents / 100.0
+            contracts = max(1, int(min(MAX_DOLLARS_PER_TRADE, balance * 0.02) / cost_per_contract))
+            actual_cost = contracts * cost_per_contract
+
+            # Edge estimate: for tail fades, edge = (100 - fair) - no_price.
+            # We approximate fair YES as ~0 for tails, ~40c for mid-range.
+            if fade_zone == "tail":
+                approx_fair_yes = 1.0  # near-zero probability
+                edge = (100 - approx_fair_yes) - no_price_cents
+            else:
+                approx_fair_yes = (mid_low + mid_high) / 2.0
+                edge = (100 - approx_fair_yes) - no_price_cents
+
+            decision = TradeDecision(
+                ticker=ticker,
+                action="buy_no",
+                strategy="tail_fade",
+                edge_cents=round(edge, 1),
+                fair_value_cents=round(100 - approx_fair_yes, 1),
+                market_price_cents=int(yes_ask),
+                price_to_pay_cents=no_price_cents,
+                contracts=contracts,
+                max_loss_dollars=round(actual_cost, 2),
+                reason=f"TAIL_FADE ({fade_zone}): YES@{yes_ask:.0f}c -> BUY NO@{no_price_cents}c | {series_ticker}",
+            )
+
+            # Balance check
+            current_balance = get_account_balance(client, logger)
+            if current_balance is not None and actual_cost > current_balance:
+                decision.reason += " | SKIP: insufficient balance"
+                decision.contracts = 0
+                decisions.append(decision)
+                continue
+
+            if not dry_run and contracts > 0:
+                try:
+                    result = client.place_order(
+                        ticker=ticker,
+                        side="no",
+                        action="buy",
+                        count=contracts,
+                        type="limit",
+                        no_price=no_price_cents,
+                        post_only=True,
+                    )
+                    order_id = result.get("order", {}).get("order_id", "unknown")
+                    decision.placed = True
+                    decision.order_id = order_id
+                    trades_placed += 1
+                    logger.info(
+                        f"  TAIL_FADE ORDER ({fade_zone}): BUY NO {ticker} x{contracts} "
+                        f"@ {no_price_cents}c (YES@{yes_ask:.0f}c) | order_id={order_id}"
+                    )
+                except Exception as e:
+                    decision.error = str(e)
+                    logger.error(f"  TAIL_FADE ORDER FAILED: {ticker} -- {e}")
+            else:
+                if contracts > 0:
+                    trades_placed += 1
+                    logger.info(
+                        f"  DRY-RUN TAIL_FADE ({fade_zone}): would BUY NO {ticker} x{contracts} "
+                        f"@ {no_price_cents}c (YES@{yes_ask:.0f}c)"
+                    )
+
+            decisions.append(decision)
+            time.sleep(0.3)  # Rate limit
+
+    logger.info(
+        f"--- TAIL FADE SESSION DONE: {len(decisions)} decisions, "
+        f"{trades_placed} trades ---"
+    )
+    return decisions
+
+
+# ---------------------------------------------------------------------------
+# Dutch Book session (weather arbitrage)
+# ---------------------------------------------------------------------------
+
+MAX_DUTCH_BOOK_TRADES = 5  # cap per session
+
+
+def run_dutch_book_session(
+    client: KalshiClient,
+    balance: float,
+    dry_run: bool,
+    logger: logging.Logger,
+) -> list[TradeDecision]:
+    """
+    Dutch Book session -- exploit overpriced weather bucket sets.
+
+    For each weather series, group open markets by event_ticker.
+    If an event has exactly 6 markets and sum(yes_bid) > 102c,
+    SELL YES on all 6 legs (1 contract each) to lock in guaranteed profit.
+
+    Profit = sum(yes_bid) - 100c per contract set.
+    """
+    logger.info("--- DUTCH BOOK SESSION START ---")
+    decisions = []
+
+    weather_series = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLA", "KXHIGHDC", "KXHIGHDEN"]
+    trades_placed = 0
+
+    for series_ticker in weather_series:
+        if trades_placed >= MAX_DUTCH_BOOK_TRADES:
+            break
+
+        # Fetch open markets for this series
+        try:
+            resp = client.get_markets(series_ticker=series_ticker, status="open", limit=100)
+            markets = resp.get("markets", [])
+        except Exception as e:
+            logger.warning(f"  Failed to fetch markets for {series_ticker}: {e}")
+            continue
+
+        # Group markets by event_ticker
+        events = {}
+        for mkt in markets:
+            event_ticker = mkt.get("event_ticker", "")
+            if event_ticker:
+                events.setdefault(event_ticker, []).append(mkt)
+
+        for event_ticker, event_markets in events.items():
+            if trades_placed >= MAX_DUTCH_BOOK_TRADES:
+                break
+
+            # Dutch book only works on complete bucket sets (exactly 6 markets)
+            if len(event_markets) != 6:
+                continue
+
+            # Sum yes_bid across all legs
+            total_yes_bid = 0
+            legs = []
+            for mkt in event_markets:
+                yes_bid = float(mkt.get("yes_bid", 0) or 0)
+                # Normalize: if < 1.0, it's dollars
+                if 0 < yes_bid < 1.0:
+                    yes_bid = yes_bid * 100
+                total_yes_bid += yes_bid
+                legs.append({
+                    "ticker": mkt.get("ticker", ""),
+                    "yes_bid": int(yes_bid),
+                    "title": mkt.get("title", ""),
+                })
+
+            if total_yes_bid <= 102:
+                continue  # Not enough edge
+
+            profit_cents = total_yes_bid - 100
+            logger.info(
+                f"  DUTCH BOOK FOUND: {event_ticker} | {len(legs)} legs | "
+                f"sum(yes_bid)={total_yes_bid:.0f}c | profit={profit_cents:.0f}c/set"
+            )
+
+            # Check balance: selling YES requires margin = max loss per leg
+            # Max loss on selling 1 YES at price P = (100 - P) cents
+            # But since we sell ALL legs, guaranteed payout is 100c, received sum(yes_bid)
+            # Net guaranteed profit = sum(yes_bid) - 100c.  No margin needed beyond
+            # what Kalshi holds (they net the positions).
+            # Conservative: check we have at least $2 available.
+            current_balance = get_account_balance(client, logger)
+            if current_balance is not None and current_balance < 2.0:
+                logger.warning(f"  SKIP DUTCH BOOK {event_ticker}: balance too low")
+                continue
+
+            event_decisions = []
+            all_placed = True
+
+            for leg in legs:
+                ticker = leg["ticker"]
+                sell_price = leg["yes_bid"]
+                if sell_price < 1:
+                    all_placed = False
+                    continue
+
+                decision = TradeDecision(
+                    ticker=ticker,
+                    action="sell_yes",
+                    strategy="dutch_book",
+                    edge_cents=round(profit_cents / len(legs), 1),
+                    fair_value_cents=round(100 / len(legs), 1),
+                    market_price_cents=sell_price,
+                    price_to_pay_cents=sell_price,
+                    contracts=1,
+                    max_loss_dollars=round((100 - sell_price) / 100.0, 2),
+                    reason=(
+                        f"DUTCH BOOK: {event_ticker} leg | "
+                        f"sell YES@{sell_price}c | total_profit={profit_cents:.0f}c"
+                    ),
+                )
+
+                if not dry_run:
+                    try:
+                        result = client.place_order(
+                            ticker=ticker,
+                            side="yes",
+                            action="sell",
+                            count=1,
+                            type="limit",
+                            yes_price=sell_price,
+                            post_only=True,
+                        )
+                        order_id = result.get("order", {}).get("order_id", "unknown")
+                        decision.placed = True
+                        decision.order_id = order_id
+                        logger.info(
+                            f"    DUTCH BOOK ORDER: SELL YES {ticker} x1 "
+                            f"@ {sell_price}c | order_id={order_id}"
+                        )
+                    except Exception as e:
+                        decision.error = str(e)
+                        all_placed = False
+                        logger.error(f"    DUTCH BOOK ORDER FAILED: {ticker} -- {e}")
+                else:
+                    logger.info(
+                        f"    DRY-RUN DUTCH BOOK: would SELL YES {ticker} x1 @ {sell_price}c"
+                    )
+
+                event_decisions.append(decision)
+                time.sleep(0.3)  # Rate limit
+
+            decisions.extend(event_decisions)
+            if all_placed and event_decisions:
+                trades_placed += 1
+
+    logger.info(
+        f"--- DUTCH BOOK SESSION DONE: {len(decisions)} decisions, "
+        f"{trades_placed} arb sets ---"
+    )
+    return decisions
+
+
+# ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1886,38 +2464,6 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         f"max_deploy={balance * MAX_DAILY_DEPLOY_PCT:.2f} "
         f"max_per_trade=${MAX_DOLLARS_PER_TRADE:.2f}"
     )
-
-    # Track today's opening balance for accurate daily drawdown calculation
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    _opening_bal_file = config.OUTPUT_DIR / ".daily_opening_balance"
-    opening_balance = balance  # fallback: use current if no file yet
-    if _opening_bal_file.exists():
-        try:
-            stored = _opening_bal_file.read_text().strip()
-            stored_date, stored_bal_str = stored.split(":", 1)
-            if stored_date == today_str:
-                opening_balance = float(stored_bal_str)
-            else:
-                # New day — record today's opening balance
-                _opening_bal_file.write_text(f"{today_str}:{balance:.4f}")
-        except Exception:
-            _opening_bal_file.write_text(f"{today_str}:{balance:.4f}")
-    else:
-        _opening_bal_file.write_text(f"{today_str}:{balance:.4f}")
-
-    daily_dd_pct = (opening_balance - balance) / opening_balance * 100 if opening_balance > 0 else 0.0
-    logger.info(f"Daily drawdown: {daily_dd_pct:.1f}% (opened ${opening_balance:.2f}, now ${balance:.2f})")
-
-    # Enforce 8% daily loss cap — pause trading and alert if breached
-    if daily_dd_pct >= DAILY_LOSS_CAP_PCT * 100 and not dry_run:
-        pause_file.touch()
-        if alert_drawdown:
-            alert_drawdown(daily_dd_pct, balance, opening_balance, is_hard_stop=True)
-        logger.warning(
-            f"Daily loss cap hit ({daily_dd_pct:.1f}% of opening ${opening_balance:.2f}). "
-            f"Trading automatically paused."
-        )
-        return []
 
     all_decisions = []
 
@@ -1972,6 +2518,26 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             logger.error(traceback.format_exc())
             if alert_bot_error:
                 alert_bot_error("auto_trade", str(e))
+
+    # --- Tail Fade session (runs every cycle) ---
+    try:
+        tail_fade_decisions = run_tail_fade_session(client, balance, dry_run, logger)
+        all_decisions.extend(tail_fade_decisions)
+    except Exception as e:
+        logger.error(f"Tail fade session crashed: {e}")
+        logger.error(traceback.format_exc())
+        if alert_bot_error:
+            alert_bot_error("auto_trade", str(e))
+
+    # --- Dutch Book session (runs every cycle) ---
+    try:
+        dutch_book_decisions = run_dutch_book_session(client, balance, dry_run, logger)
+        all_decisions.extend(dutch_book_decisions)
+    except Exception as e:
+        logger.error(f"Dutch book session crashed: {e}")
+        logger.error(traceback.format_exc())
+        if alert_bot_error:
+            alert_bot_error("auto_trade", str(e))
 
     # --- Copy-trade session ---
     if copy:
@@ -2051,11 +2617,12 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             if alert_bot_error:
                 alert_bot_error("auto_trade", str(e))
 
-    # --- Drawdown alert (actual daily loss vs opening balance) ---
-    if opening_balance > 0:
-        daily_dd_pct = (opening_balance - balance) / opening_balance * 100
-        if alert_drawdown and daily_dd_pct >= 5.0:
-            alert_drawdown(daily_dd_pct, balance, opening_balance)
+    # --- Drawdown check ---
+    total_risk = sum(d.max_loss_dollars for d in all_decisions if d.placed or (dry_run and d.contracts > 0))
+    if balance > 0:
+        dd_pct = (total_risk / balance) * 100
+        if alert_drawdown and dd_pct >= 5.0:
+            alert_drawdown(dd_pct, balance)
 
     # --- Summary ---
     trades_placed = [d for d in all_decisions if d.placed or (dry_run and d.contracts > 0)]
@@ -2147,8 +2714,8 @@ if __name__ == "__main__":
         help="Place real orders (default: dry-run)",
     )
     parser.add_argument(
-        "--dry-run", action="store_true", default=True,
-        help="Show what would happen without placing orders (default)",
+        "--dry-run", action="store_true", default=False,
+        help="Show what would happen without placing orders",
     )
     parser.add_argument(
         "--weather-only", action="store_true",
@@ -2172,6 +2739,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # --live enables live trading; --dry-run overrides it back to dry mode
+    # Without any flag, defaults to dry-run (is_live=False)
     is_live = args.live and not args.dry_run
     only_flags = [args.weather_only, args.btc_only, args.sports_only, args.arb_only]
     any_only = any(only_flags)

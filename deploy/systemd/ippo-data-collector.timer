@@ -1,0 +1,11 @@
+[Unit]
+Description=Ippo Data Collector Timer - Snapshot market prices every 15 min during market hours (9am-11pm UTC)
+
+[Timer]
+# Fire at :00, :15, :30, :45 for each hour 09:00 through 23:00 UTC
+OnCalendar=*-*-* 09..23:00/15:00
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

@@ -1,21 +1,25 @@
 """
 autoresearch/research_loop.py -- Weather Forecast Arbitrage optimization loop.
 
+Uses real Kalshi settled market data only. No synthetic scenarios.
+
 This is the overnight self-improvement engine specifically for the weather
 forecast vs. Kalshi market price strategy. It:
 
 1. Reads the current candidate_strategy.py (weather-specific parameters)
-2. Simulates realistic weather scenarios:
-   - True temp = NWS forecast + normal noise (configurable stdev)
-   - Fake Kalshi bucket/threshold markets around the true temp
-   - Market prices = noisy implied probabilities from a "dumb" model
-3. Runs the weather edge detection (from weather_strategy.py) against those markets
+2. Loads real settled weather markets from historical_settlements_with_prices.json
+   - Each (series, date) group becomes one backtest scenario
+   - Market prices come from actual previous_price data
+   - Settlement results (yes/no) determine the true outcome
+3. Runs the weather edge detection against those real markets
 4. Scores based on: Sortino ratio, ROI, max drawdown, win rate
 5. Mutates one parameter at a time, keeps winners, reverts losers
 6. Logs everything to autoresearch/results.log
 """
 
+import ast
 import os
+import re
 import sys
 import json
 import math
@@ -27,6 +31,7 @@ import copy
 
 import numpy as np
 from pathlib import Path
+from collections import defaultdict
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
@@ -59,12 +64,21 @@ except ImportError:
     NWS_OBSERVATION_STATIONS = {}
     SERIES_TO_CITY = {}
 
+try:
+    import anthropic as _anthropic_module
+except ImportError:
+    _anthropic_module = None
+
 console = Console()
 
 STRATEGY_FILE = Path(__file__).parent / "candidate_strategy.py"
 RESULTS_LOG = Path(__file__).parent / "results.log"
 REAL_OUTCOMES_FILE = Path(__file__).parent / "real_outcomes.json"
 KALSHI_CACHE_FILE = Path(__file__).parent / "kalshi_cache.json"
+HISTORICAL_SETTLEMENTS_FILE = Path(__file__).parent.parent / "output" / "historical_settlements_with_prices.json"
+
+# Legacy weight — no longer used (all scenarios are real historical data now).
+KALSHI_SCENARIO_WEIGHT = 0
 
 # =============================================================================
 # WEATHER-SPECIFIC MUTATION SPACE
@@ -102,44 +116,28 @@ MUTATION_SPACE = {
     # Ensemble tightness
     "TIGHT_ENSEMBLE_THRESHOLD": [1.5, 2.0, 2.5, 3.0],
     "TIGHT_ENSEMBLE_MULTIPLIER": [1.0, 1.2, 1.5, 2.0],
-}
-
-# =============================================================================
-# CRYPTO-SPECIFIC MUTATION SPACE
-# =============================================================================
-
-CRYPTO_MUTATION_SPACE = {
-    # Edge threshold in cents
-    "CRYPTO_MIN_EDGE_CENTS": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-    # Position sizing
-    "CRYPTO_CONTRACTS_PER_TRADE": [3, 5, 8, 10, 15],
-    "CRYPTO_MAX_POSITION_DOLLARS": [3.0, 5.0, 7.0, 10.0],
-    # Per-asset vol bias: multiplicative scale applied to realized vol
-    # >1.0 = conservative (assumes more vol), <1.0 = aggressive (assumes less vol)
-    "CRYPTO_VOL_BIAS_BTC": [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3],
-    "CRYPTO_VOL_BIAS_ETH": [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3],
-    "CRYPTO_VOL_BIAS_SOL": [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3],
-    # Bucket bias corrections
-    "CRYPTO_CENTER_BUCKET_BIAS": [0.80, 0.85, 0.90, 0.95, 1.00],
-    "CRYPTO_TAIL_BUCKET_MULTIPLIER": [0.90, 0.95, 1.00, 1.05, 1.10, 1.20],
-}
-
-# =============================================================================
-# SPORTS-SPECIFIC MUTATION SPACE
-# =============================================================================
-
-SPORTS_MUTATION_SPACE = {
-    # Home court advantage (points)
-    "SPORTS_HOME_COURT_ADVANTAGE": [2.0, 2.5, 3.0, 3.2, 3.5, 4.0, 4.5],
-    # Game margin stdev for logistic conversion
-    "SPORTS_NBA_GAME_STDEV": [9.0, 10.0, 11.0, 11.5, 12.0, 13.0, 14.0],
-    # Recent form weight
-    "SPORTS_RECENT_FORM_WEIGHT": [0.10, 0.20, 0.30, 0.40, 0.50],
-    # Edge threshold (percentage points)
-    "SPORTS_MIN_EDGE_PCT": [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0],
-    # Position sizing
-    "SPORTS_CONTRACTS_PER_TRADE": [3, 5, 8, 10, 15],
-    "SPORTS_MAX_POSITION_DOLLARS": [3.0, 5.0, 7.0, 10.0],
+    # Per-strategy edge thresholds
+    "CRYPTO_EDGE_THRESHOLD_CENTS": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+    "SPORTS_EDGE_THRESHOLD_CENTS": [3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    "ARB_EDGE_THRESHOLD_CENTS": [1.5, 2.0, 3.0, 4.0, 5.0],
+    "EXIT_EDGE_THRESHOLD_CENTS": [1.0, 1.5, 2.0, 3.0, 4.0],
+    # Blend weights (HRRR + GFS + NWS)
+    "BLEND_HRRR_DAY0": [0.25, 0.30, 0.35, 0.40, 0.50, 0.55],
+    "BLEND_GFS_DAY0": [0.20, 0.25, 0.30, 0.35, 0.40],
+    "BLEND_NWS_DAY0": [0.15, 0.20, 0.25, 0.30, 0.35],
+    "BLEND_HRRR_DAY1": [0.10, 0.15, 0.20, 0.25, 0.30],
+    "BLEND_GFS_DAY1": [0.30, 0.35, 0.40, 0.45, 0.50],
+    "BLEND_NWS_DAY1": [0.25, 0.30, 0.35, 0.40, 0.45],
+    "BLEND_GFS_DAY2": [0.50, 0.55, 0.60, 0.65, 0.70],
+    "BLEND_NWS_DAY2": [0.30, 0.35, 0.40, 0.45, 0.50],
+    # Tail fade parameters
+    "TAIL_FADE_MAX_PRICE": [3, 5, 7, 10, 15, 20],
+    "TAIL_FADE_MIN_VOLUME": [0, 100, 500, 1000, 5000],
+    "TAIL_FADE_WEATHER_ENABLED": [0, 1],
+    "TAIL_FADE_CRYPTO_ENABLED": [0, 1],
+    "TAIL_FADE_NBA_ENABLED": [0, 1],
+    "TAIL_FADE_MID_LOW": [30, 35, 40, 45],
+    "TAIL_FADE_MID_HIGH": [50, 55, 60],
 }
 
 
@@ -344,207 +342,241 @@ def generate_weather_scenario(
 
 
 # =============================================================================
-# CRYPTO SCENARIO SIMULATOR
+# HISTORICAL SETTLED MARKET LOADER (replaces synthetic scenarios)
 # =============================================================================
 
-@dataclass
-class SimulatedCryptoMarket:
-    """A synthetic log-normal crypto range bucket market."""
-    asset: str
-    bucket_low: float      # normalized: current_price = 1.0
-    bucket_high: float
-    is_center: bool        # True if bucket is within ~2 bucket-widths of current price
-    yes_ask_cents: float
-    yes_bid_cents: float
-    true_probability: float  # P(price lands here) given true vol
-
-
-# Realistic annualized vol ranges per asset
-CRYPTO_VOL_RANGES = {
-    "BTC": (0.30, 1.20),
-    "ETH": (0.40, 1.50),
-    "SOL": (0.60, 2.00),
+# Series ticker -> city name (matching the CITIES config above)
+_SERIES_TO_CITY_NAME = {
+    "KXHIGHNY": "NYC",
+    "KXHIGHCHI": "Chicago",
+    "KXHIGHMIA": "Miami",
+    "KXHIGHLA": "LA",
+    "KXHIGHDC": "DC",
+    "KXHIGHDEN": "Denver",
 }
-CRYPTO_ASSETS_SIM = ["BTC", "ETH", "SOL"]
 
 
-def calc_lognormal_bucket_prob(
-    current_price: float,
-    bucket_low: float,
-    bucket_high: float,
-    period_vol: float,
-) -> float:
-    """P(lognormal price lands in [bucket_low, bucket_high]) given period_vol."""
-    if period_vol <= 0:
-        return 0.999 if bucket_low <= current_price <= bucket_high else 0.001
-    if bucket_low <= 0:
-        z = math.log(bucket_high / current_price) / period_vol
-        return max(0.001, min(0.999, normal_cdf(z)))
-    if bucket_high >= current_price * 5:
-        z = math.log(bucket_low / current_price) / period_vol
-        return max(0.001, min(0.999, 1.0 - normal_cdf(z)))
-    z_low = math.log(bucket_low / current_price) / period_vol
-    z_high = math.log(bucket_high / current_price) / period_vol
-    return max(0.001, min(0.999, normal_cdf(z_high) - normal_cdf(z_low)))
-
-
-def generate_crypto_scenario(
-    rng: np.random.Generator,
-    n_buckets: int = 13,
-) -> tuple[list[SimulatedCryptoMarket], dict]:
+def _parse_market_title(title: str) -> dict:
     """
-    Generate one synthetic crypto scenario (3 assets, n_buckets each).
+    Parse a Kalshi weather market title into market_type, bucket bounds, or threshold.
 
-    Retail bias: center buckets are overpriced (retail assumes 'crypto stays put')
-    by pricing with a systematically lower vol. Tail buckets use more accurate vol.
-
-    Returns:
-        (markets, outcomes) where outcomes[asset] = {actual_price, period_vol, ...}
+    Examples:
+        'Will the **high temp in NYC** be 59-60° ...' -> bucket [59, 60]
+        'Will the high temp in Chicago be >70° ...'   -> above, threshold=70
+        'Will the **high temp in NYC** be <53° ...'   -> below, threshold=53
     """
-    markets = []
-    outcomes = {}
-    current_price = 1.0
-    half = n_buckets // 2
-
-    for asset in CRYPTO_ASSETS_SIM:
-        vol_low, vol_high = CRYPTO_VOL_RANGES[asset]
-        true_annual_vol = rng.uniform(vol_low, vol_high)
-        hours_to_settle = float(rng.uniform(1.0, 23.0))
-        true_period_vol = (true_annual_vol / math.sqrt(365)) * math.sqrt(hours_to_settle / 24.0)
-
-        # Bucket width ~2.5% of price (models BTC $250/$10k, ETH $25/$1k, SOL $2/$80)
-        bucket_width = 0.025
-
-        for i in range(-half, half + 1):
-            bucket_low = current_price * (1 + i * bucket_width)
-            bucket_high = current_price * (1 + (i + 1) * bucket_width)
-            is_center = abs(i) <= 2
-
-            true_prob = calc_lognormal_bucket_prob(
-                current_price, bucket_low, bucket_high, true_period_vol
-            )
-
-            # Retail prices center buckets with underestimated vol (they think price won't move)
-            if is_center:
-                retail_vol = true_annual_vol * rng.uniform(0.55, 0.75)
-            else:
-                retail_vol = true_annual_vol * rng.uniform(0.80, 1.05)
-
-            retail_period_vol = (retail_vol / math.sqrt(365)) * math.sqrt(hours_to_settle / 24.0)
-            market_prob = calc_lognormal_bucket_prob(
-                current_price, bucket_low, bucket_high, retail_period_vol
-            )
-            market_prob = max(0.01, min(0.99, market_prob + rng.normal(0, 0.012)))
-
-            spread = rng.uniform(2.0, 6.0)
-            mid = market_prob * 100
-            markets.append(SimulatedCryptoMarket(
-                asset=asset,
-                bucket_low=bucket_low,
-                bucket_high=bucket_high,
-                is_center=is_center,
-                yes_ask_cents=round(min(99, mid + spread / 2), 1),
-                yes_bid_cents=round(max(1, mid - spread / 2), 1),
-                true_probability=true_prob,
-            ))
-
-        actual_price = current_price * math.exp(rng.normal(0, true_period_vol))
-        outcomes[asset] = {
-            "actual_price": actual_price,
-            "true_annual_vol": true_annual_vol,
-            "period_vol": true_period_vol,
-            "hours_to_settle": hours_to_settle,
+    # Bucket: "be 59-60°" or "be 59-60 °"
+    bucket_match = re.search(r"be (\d+)-(\d+)\s*°", title)
+    if bucket_match:
+        return {
+            "market_type": "bucket",
+            "bucket_low": float(bucket_match.group(1)),
+            "bucket_high": float(bucket_match.group(2)),
+            "threshold": 0.0,
         }
 
-    return markets, outcomes
+    # Above: "be >60°"
+    above_match = re.search(r">(\d+)\s*°", title)
+    if above_match:
+        threshold = float(above_match.group(1))
+        return {
+            "market_type": "above",
+            "bucket_low": threshold,
+            "bucket_high": 999.0,
+            "threshold": threshold,
+        }
+
+    # Below: "be <53°"
+    below_match = re.search(r"<(\d+)\s*°", title)
+    if below_match:
+        threshold = float(below_match.group(1))
+        return {
+            "market_type": "below",
+            "bucket_low": 0.0,
+            "bucket_high": threshold,
+            "threshold": threshold,
+        }
+
+    return None
 
 
-# =============================================================================
-# SPORTS SCENARIO SIMULATOR
-# =============================================================================
-
-@dataclass
-class SimulatedSportsMarket:
-    """A synthetic NBA game win-probability market (YES = home team wins)."""
-    game_id: str
-    home_strength: float   # net adj. point differential per game
-    away_strength: float
-    yes_ask_cents: float
-    yes_bid_cents: float
-    true_win_prob: float   # ground-truth P(home wins)
-
-
-# Ground-truth NBA parameters used in simulation (not tunable — fixed reality)
-_TRUE_HCA = 3.2
-_TRUE_STDEV = 11.5
-
-
-def logistic_win_prob(point_diff: float, stdev: float) -> float:
-    """P(home wins) given expected point differential and game stdev."""
-    return max(0.05, min(0.95, normal_cdf(point_diff / stdev)))
-
-
-def generate_sports_scenario(
-    rng: np.random.Generator,
-    n_games: int = 5,
-) -> tuple[list[SimulatedSportsMarket], dict]:
+def _infer_true_temp_from_group(group_markets: list[dict]) -> float | None:
     """
-    Generate n_games synthetic NBA game markets.
+    Infer the actual temperature from a group of settled markets for the same
+    city+date. The bucket market that settled YES tells us the temp was in that
+    range; we use its midpoint as the true temp.
 
-    Retail bias: slight underestimation of home court advantage (retail focuses on
-    overall records, not home/away splits) plus random narrative noise.
+    For threshold markets: if '>X' settled YES, temp was above X.
+    If '<X' settled YES, temp was below X. We combine all YES results to
+    narrow down the range, then use the midpoint.
+    """
+    # First try: find a bucket market that settled YES
+    for m in group_markets:
+        if m["result"] != "yes":
+            continue
+        parsed = _parse_market_title(m["title"])
+        if parsed and parsed["market_type"] == "bucket":
+            return (parsed["bucket_low"] + parsed["bucket_high"]) / 2.0
+
+    # Fallback: use threshold markets to bracket the temp
+    lower_bound = -999.0
+    upper_bound = 999.0
+    for m in group_markets:
+        parsed = _parse_market_title(m["title"])
+        if not parsed:
+            continue
+        if m["result"] == "yes":
+            if parsed["market_type"] == "above":
+                # temp > threshold
+                lower_bound = max(lower_bound, parsed["threshold"])
+            elif parsed["market_type"] == "below":
+                # temp < threshold
+                upper_bound = min(upper_bound, parsed["threshold"])
+        elif m["result"] == "no":
+            if parsed["market_type"] == "above":
+                # temp <= threshold
+                upper_bound = min(upper_bound, parsed["threshold"])
+            elif parsed["market_type"] == "below":
+                # temp >= threshold
+                lower_bound = max(lower_bound, parsed["threshold"])
+
+    if lower_bound > -999 or upper_bound < 999:
+        if lower_bound <= -999:
+            lower_bound = upper_bound - 5
+        if upper_bound >= 999:
+            upper_bound = lower_bound + 5
+        return (lower_bound + upper_bound) / 2.0
+
+    return None
+
+
+def load_historical_scenarios() -> list[tuple[list[SimulatedMarket], dict]]:
+    """
+    Load real settled weather market data from historical_settlements_with_prices.json
+    and convert into (markets, true_temps) scenario tuples for backtesting.
+
+    Each (series, date) group of markets becomes one scenario. Markets are filtered
+    to those with previous_price > 0 and volume > 0. The true temperature is
+    inferred from which bucket market settled YES.
 
     Returns:
-        (markets, outcomes) where outcomes[game_id] = {home_won, true_win_prob}
+        List of (markets, true_temps) tuples — one per city+date group.
+        Returns empty list if file doesn't exist or has no valid weather data.
     """
-    markets = []
-    outcomes = {}
+    if not HISTORICAL_SETTLEMENTS_FILE.exists():
+        console.print(
+            f"[red]Historical settlements file not found: {HISTORICAL_SETTLEMENTS_FILE}[/red]"
+        )
+        return []
 
-    for g in range(n_games):
-        game_id = f"GAME{g}"
-        # Team strength from realistic NBA distribution (~N(0, 5 pts/game spread)
-        home_strength = float(rng.normal(0, 5.0))
-        away_strength = float(rng.normal(0, 5.0))
+    try:
+        with open(HISTORICAL_SETTLEMENTS_FILE, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        console.print(f"[red]Failed to load historical settlements: {e}[/red]")
+        return []
 
-        # Ground truth
-        true_diff = home_strength - away_strength + _TRUE_HCA
-        true_win_prob = logistic_win_prob(true_diff, _TRUE_STDEV)
+    all_markets = data.get("markets", [])
+    if not all_markets:
+        return []
 
-        # Retail pricing: underweights HCA (uses ~85% of true value), adds noise
-        retail_diff = home_strength - away_strength + _TRUE_HCA * 0.85
-        retail_win_prob = logistic_win_prob(retail_diff, _TRUE_STDEV * 1.08)
-        market_prob = max(0.05, min(0.95, retail_win_prob + float(rng.normal(0, 0.04))))
+    # Filter to weather series with valid price and volume
+    weather_series = set(_SERIES_TO_CITY_NAME.keys())
+    valid_markets = [
+        m for m in all_markets
+        if m.get("series") in weather_series
+        and float(m.get("previous_price", "0")) > 0
+        and float(m.get("volume", "0")) > 0
+    ]
 
-        spread = rng.uniform(2.0, 5.0)
-        mid = market_prob * 100
-        markets.append(SimulatedSportsMarket(
-            game_id=game_id,
-            home_strength=home_strength,
-            away_strength=away_strength,
-            yes_ask_cents=round(min(97, mid + spread / 2), 1),
-            yes_bid_cents=round(max(3, mid - spread / 2), 1),
-            true_win_prob=true_win_prob,
-        ))
+    if not valid_markets:
+        return []
 
-        home_won = bool(rng.random() < true_win_prob)
-        outcomes[game_id] = {"home_won": home_won, "true_win_prob": true_win_prob}
+    # Group by (series, date) — each group = one daily scenario for one city
+    groups = defaultdict(list)
+    for m in valid_markets:
+        # close_time is like "2026-03-22T04:59:00Z" — take the date part
+        date_key = m["close_time"][:10]
+        groups[(m["series"], date_key)].append(m)
 
-    return markets, outcomes
+    scenarios = []
+    for (series, date_key), group_markets in groups.items():
+        city = _SERIES_TO_CITY_NAME.get(series)
+        if not city:
+            continue
+
+        # Infer the true temperature from settlement results
+        true_temp = _infer_true_temp_from_group(group_markets)
+        if true_temp is None:
+            continue
+
+        # Convert each market in the group to a SimulatedMarket
+        sim_markets = []
+        for m in group_markets:
+            parsed = _parse_market_title(m["title"])
+            if not parsed:
+                continue
+
+            # previous_price is in dollars (e.g. "0.0600"); convert to cents
+            prev_price_cents = float(m["previous_price"]) * 100.0
+            prev_yes_ask = float(m.get("prev_yes_ask", "0")) * 100.0
+            prev_yes_bid = float(m.get("prev_yes_bid", "0")) * 100.0
+
+            # Use prev_yes_ask/prev_yes_bid if available, else derive from previous_price
+            if prev_yes_ask > 0 and prev_yes_bid > 0:
+                yes_ask = prev_yes_ask
+                yes_bid = prev_yes_bid
+            else:
+                yes_ask = min(99.0, prev_price_cents + 1.0)
+                yes_bid = max(1.0, prev_price_cents - 1.0)
+
+            # true_probability: 1.0 if settled YES, 0.0 if settled NO
+            true_prob = 1.0 if m["result"] == "yes" else 0.0
+
+            sim_markets.append(SimulatedMarket(
+                ticker=m["ticker"],
+                title=m["title"],
+                city=city,
+                market_type=parsed["market_type"],
+                bucket_low=parsed["bucket_low"],
+                bucket_high=parsed["bucket_high"],
+                threshold=parsed["threshold"],
+                yes_bid_cents=round(yes_bid, 1),
+                yes_ask_cents=round(yes_ask, 1),
+                true_probability=true_prob,
+                volume=int(float(m.get("volume", "0"))),
+                days_out=0,  # already settled
+            ))
+
+        if not sim_markets:
+            continue
+
+        true_temps = {
+            city: {
+                "forecast": true_temp,
+                "true_temp": true_temp,
+                "days_out": 0,
+            }
+        }
+
+        scenarios.append((sim_markets, true_temps))
+
+    return scenarios
 
 
 # =============================================================================
 # REAL OUTCOME DATA LOADING
 # =============================================================================
 
-def load_real_outcomes(strategy: str = "weather") -> list[dict]:
+def load_real_outcomes() -> list[dict]:
     """
     Load real settlement data from real_outcomes.json (written by settlement_tracker).
 
-    Args:
-        strategy: Filter to "weather", "crypto", or "sports" outcomes.
+    Returns a list of real outcome scenarios that can replace synthetic scenarios
+    in backtesting. Each entry contains the data needed to reconstruct a
+    SimulatedMarket + true_temps pair from actual trading results.
 
-    Returns a list of real outcome records for the specified strategy.
-    Returns empty list if file doesn't exist, is empty, or has no matching outcomes.
+    Returns empty list if file doesn't exist, is empty, or has no weather outcomes.
     """
     if not REAL_OUTCOMES_FILE.exists():
         return []
@@ -559,21 +591,15 @@ def load_real_outcomes(strategy: str = "weather") -> list[dict]:
     if not outcomes:
         return []
 
-    if strategy == "weather":
-        # Weather outcomes need forecast + actual temp for scenario reconstruction
-        return [
-            o for o in outcomes
-            if o.get("strategy") == "weather"
-            and o.get("forecast_temp") is not None
-            and o.get("actual_temp") is not None
-        ]
-
-    # Crypto and sports: just need strategy tag + settlement result + P&L
-    return [
+    # Filter to weather trades only (have forecast/actual temp data)
+    weather_outcomes = [
         o for o in outcomes
-        if o.get("strategy") == strategy
-        and o.get("settlement_result") in ("yes", "no")
+        if o.get("strategy") == "weather"
+        and o.get("forecast_temp") is not None
+        and o.get("actual_temp") is not None
     ]
+
+    return weather_outcomes
 
 
 def real_outcome_to_scenario(outcome: dict) -> tuple[list[SimulatedMarket], dict]:
@@ -941,7 +967,6 @@ def load_strategy_params() -> dict:
         import candidate_strategy as strat
         importlib.reload(strat)
         return {
-            # Weather params
             "forecast_stdev": strat.get_forecast_stdev(),
             "edge_threshold_cents": strat.EDGE_THRESHOLD_CENTS,
             "contracts_per_trade": strat.CONTRACTS_PER_TRADE,
@@ -955,24 +980,6 @@ def load_strategy_params() -> dict:
             "min_volume": strat.MIN_VOLUME,
             "tight_ensemble_threshold": strat.TIGHT_ENSEMBLE_THRESHOLD,
             "tight_ensemble_multiplier": strat.TIGHT_ENSEMBLE_MULTIPLIER,
-            # Crypto params
-            "crypto_min_edge_cents": strat.CRYPTO_MIN_EDGE_CENTS,
-            "crypto_contracts_per_trade": strat.CRYPTO_CONTRACTS_PER_TRADE,
-            "crypto_max_position_dollars": strat.CRYPTO_MAX_POSITION_DOLLARS,
-            "crypto_vol_biases": {
-                "BTC": strat.CRYPTO_VOL_BIAS_BTC,
-                "ETH": strat.CRYPTO_VOL_BIAS_ETH,
-                "SOL": strat.CRYPTO_VOL_BIAS_SOL,
-            },
-            "crypto_center_bucket_bias": strat.CRYPTO_CENTER_BUCKET_BIAS,
-            "crypto_tail_bucket_multiplier": strat.CRYPTO_TAIL_BUCKET_MULTIPLIER,
-            # Sports params
-            "sports_home_court_advantage": strat.SPORTS_HOME_COURT_ADVANTAGE,
-            "sports_nba_game_stdev": strat.SPORTS_NBA_GAME_STDEV,
-            "sports_recent_form_weight": strat.SPORTS_RECENT_FORM_WEIGHT,
-            "sports_min_edge_pct": strat.SPORTS_MIN_EDGE_PCT,
-            "sports_contracts_per_trade": strat.SPORTS_CONTRACTS_PER_TRADE,
-            "sports_max_position_dollars": strat.SPORTS_MAX_POSITION_DOLLARS,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -1160,245 +1167,6 @@ def settle_trades(
 
 
 # =============================================================================
-# CRYPTO EDGE DETECTION & SETTLEMENT
-# =============================================================================
-
-@dataclass
-class CryptoDetectedEdge:
-    """An edge found by our model in a simulated crypto market."""
-    market: SimulatedCryptoMarket
-    fair_value_cents: float
-    edge_cents: float
-    side: str        # "buy_yes" or "buy_no"
-    contracts: int
-    cost_dollars: float
-
-
-def detect_crypto_edges(
-    markets: list[SimulatedCryptoMarket],
-    outcomes: dict,
-    params: dict,
-) -> list[CryptoDetectedEdge]:
-    """
-    Run crypto edge detection against simulated markets using candidate params.
-
-    In simulation the 'true_annual_vol' is accessible from outcomes — our model
-    applies CRYPTO_VOL_BIAS_* to that, testing whether the bias helps calibration.
-    In production, realized vol comes from the API; the bias scales it.
-    """
-    if "error" in params:
-        return []
-
-    edges = []
-    min_edge = params.get("crypto_min_edge_cents", 4.0)
-    contracts_base = params.get("crypto_contracts_per_trade", 5)
-    max_pos = params.get("crypto_max_position_dollars", 5.0)
-    vol_biases = params.get("crypto_vol_biases", {"BTC": 1.0, "ETH": 1.0, "SOL": 1.0})
-    center_bias = params.get("crypto_center_bucket_bias", 0.95)
-    tail_mult = params.get("crypto_tail_bucket_multiplier", 1.0)
-
-    for m in markets:
-        asset_outcome = outcomes.get(m.asset)
-        if not asset_outcome:
-            continue
-
-        true_annual_vol = asset_outcome["true_annual_vol"]
-        hours_to_settle = asset_outcome["hours_to_settle"]
-
-        # Our model applies a per-asset bias to the realized vol estimate
-        vol_bias = vol_biases.get(m.asset, 1.0)
-        model_annual_vol = true_annual_vol * vol_bias
-        model_period_vol = (model_annual_vol / math.sqrt(365)) * math.sqrt(hours_to_settle / 24.0)
-
-        current_price = 1.0
-        fair_yes_prob = calc_lognormal_bucket_prob(
-            current_price, m.bucket_low, m.bucket_high, model_period_vol
-        )
-
-        # Apply bucket bias corrections
-        if m.is_center:
-            fair_yes_prob = max(0.001, min(0.999, fair_yes_prob * center_bias))
-        else:
-            fair_yes_prob = max(0.001, min(0.999, fair_yes_prob * tail_mult))
-
-        fair_yes_cents = fair_yes_prob * 100.0
-        fair_no_cents = 100.0 - fair_yes_cents
-
-        # BUY YES edge (underpriced tail or any bucket)
-        if m.yes_ask_cents > 0:
-            buy_yes_edge = fair_yes_cents - m.yes_ask_cents
-            if buy_yes_edge > min_edge:
-                cost_per = m.yes_ask_cents / 100.0
-                n = min(contracts_base, max(1, int(max_pos / cost_per))) if cost_per > 0 else contracts_base
-                edges.append(CryptoDetectedEdge(
-                    market=m,
-                    fair_value_cents=round(fair_yes_cents, 2),
-                    edge_cents=round(buy_yes_edge, 2),
-                    side="buy_yes",
-                    contracts=n,
-                    cost_dollars=round(n * cost_per, 4),
-                ))
-
-        # BUY NO edge (overpriced center bucket)
-        if m.yes_bid_cents > 0:
-            buy_no_edge = fair_no_cents - (100.0 - m.yes_bid_cents)
-            if buy_no_edge > min_edge:
-                no_price = 100.0 - m.yes_bid_cents
-                cost_per = no_price / 100.0
-                n = min(contracts_base, max(1, int(max_pos / cost_per))) if cost_per > 0 else contracts_base
-                edges.append(CryptoDetectedEdge(
-                    market=m,
-                    fair_value_cents=round(fair_no_cents, 2),
-                    edge_cents=round(buy_no_edge, 2),
-                    side="buy_no",
-                    contracts=n,
-                    cost_dollars=round(n * cost_per, 4),
-                ))
-
-    return edges
-
-
-def settle_crypto_trades(
-    edges: list[CryptoDetectedEdge],
-    outcomes: dict,
-) -> list[dict]:
-    """Settle crypto trades against drawn settlement prices."""
-    results = []
-    for e in edges:
-        m = e.market
-        asset_outcome = outcomes.get(m.asset)
-        if not asset_outcome:
-            continue
-
-        actual_price = asset_outcome["actual_price"]
-        yes_happened = m.bucket_low <= actual_price < m.bucket_high
-
-        if e.side == "buy_yes":
-            pnl = e.contracts * (100 - m.yes_ask_cents) / 100.0 if yes_happened else -e.cost_dollars
-        else:
-            no_price = 100 - m.yes_bid_cents
-            pnl = e.contracts * (100 - no_price) / 100.0 if not yes_happened else -e.cost_dollars
-
-        results.append({
-            "asset": m.asset,
-            "side": e.side,
-            "edge_cents": e.edge_cents,
-            "contracts": e.contracts,
-            "cost": e.cost_dollars,
-            "pnl": round(pnl, 4),
-            "won": pnl > 0,
-        })
-
-    return results
-
-
-# =============================================================================
-# SPORTS EDGE DETECTION & SETTLEMENT
-# =============================================================================
-
-@dataclass
-class SportsDetectedEdge:
-    """An edge found by our model in a simulated sports market."""
-    market: SimulatedSportsMarket
-    fair_value_cents: float
-    edge_cents: float
-    side: str        # "buy_yes" or "buy_no"
-    contracts: int
-    cost_dollars: float
-
-
-def detect_sports_edges(
-    markets: list[SimulatedSportsMarket],
-    params: dict,
-) -> list[SportsDetectedEdge]:
-    """
-    Run sports edge detection against simulated NBA markets using candidate params.
-
-    Our model's win probability uses SPORTS_HOME_COURT_ADVANTAGE and
-    SPORTS_NBA_GAME_STDEV. When these diverge from the true values, we
-    under/over-estimate win probability and generate wrong edges.
-    """
-    if "error" in params:
-        return []
-
-    edges = []
-    hca = params.get("sports_home_court_advantage", 3.2)
-    stdev = params.get("sports_nba_game_stdev", 11.5)
-    min_edge = params.get("sports_min_edge_pct", 5.0)
-    contracts_base = params.get("sports_contracts_per_trade", 5)
-    max_pos = params.get("sports_max_position_dollars", 5.0)
-
-    for m in markets:
-        # Our model's estimated win probability for home team
-        model_diff = (m.home_strength - m.away_strength + hca)
-        model_win_prob = logistic_win_prob(model_diff, stdev)
-        fair_yes_cents = model_win_prob * 100.0
-        fair_no_cents = 100.0 - fair_yes_cents
-
-        buy_yes_edge = fair_yes_cents - m.yes_ask_cents
-        buy_no_edge = fair_no_cents - (100.0 - m.yes_bid_cents)
-
-        if buy_yes_edge > min_edge:
-            cost_per = m.yes_ask_cents / 100.0
-            n = min(contracts_base, max(1, int(max_pos / cost_per))) if cost_per > 0 else contracts_base
-            edges.append(SportsDetectedEdge(
-                market=m,
-                fair_value_cents=round(fair_yes_cents, 2),
-                edge_cents=round(buy_yes_edge, 2),
-                side="buy_yes",
-                contracts=n,
-                cost_dollars=round(n * cost_per, 4),
-            ))
-        elif buy_no_edge > min_edge:
-            no_price = 100.0 - m.yes_bid_cents
-            cost_per = no_price / 100.0
-            n = min(contracts_base, max(1, int(max_pos / cost_per))) if cost_per > 0 else contracts_base
-            edges.append(SportsDetectedEdge(
-                market=m,
-                fair_value_cents=round(fair_no_cents, 2),
-                edge_cents=round(buy_no_edge, 2),
-                side="buy_no",
-                contracts=n,
-                cost_dollars=round(n * cost_per, 4),
-            ))
-
-    return edges
-
-
-def settle_sports_trades(
-    edges: list[SportsDetectedEdge],
-    outcomes: dict,
-) -> list[dict]:
-    """Settle sports trades against drawn game outcomes."""
-    results = []
-    for e in edges:
-        m = e.market
-        outcome = outcomes.get(m.game_id)
-        if not outcome:
-            continue
-
-        yes_happened = outcome["home_won"]
-
-        if e.side == "buy_yes":
-            pnl = e.contracts * (100 - m.yes_ask_cents) / 100.0 if yes_happened else -e.cost_dollars
-        else:
-            no_price = 100 - m.yes_bid_cents
-            pnl = e.contracts * (100 - no_price) / 100.0 if not yes_happened else -e.cost_dollars
-
-        results.append({
-            "game_id": m.game_id,
-            "side": e.side,
-            "edge_cents": e.edge_cents,
-            "contracts": e.contracts,
-            "cost": e.cost_dollars,
-            "pnl": round(pnl, 4),
-            "won": pnl > 0,
-        })
-
-    return results
-
-
-# =============================================================================
 # SCORING
 # =============================================================================
 
@@ -1509,19 +1277,23 @@ def run_weather_backtest(
     seed: int = 42,
     n_scenarios: int = 200,
     use_real_data: bool = False,
+    walk_forward: bool = False,
+    _historical_cache: list | None = None,
 ) -> dict:
     """
-    Run a full weather strategy backtest:
+    Run a full weather strategy backtest using ONLY real historical data.
+
     1. Load candidate_strategy params
-    2. Generate n_scenarios random weather days
+    2. Load real settled weather markets from historical_settlements_with_prices.json
     3. Detect edges and scale positions relative to current balance
     4. Settle trades, accumulate P&L
     5. Score the result
 
-    If use_real_data=True and real_outcomes.json exists, the FIRST N scenarios
-    (where N = number of real outcomes) use real settlement data. The remaining
-    scenarios are filled with synthetic data. This ensures the strategy is
-    optimized against real market behavior first, then explored with simulation.
+    The seed parameter is used to shuffle the order of historical scenarios
+    so that multi-seed validation explores different orderings.
+
+    If walk_forward=True, the first 70% of scenarios are used for training
+    and the last 30% for testing. Both train_score and test_score are returned.
 
     Returns dict with all metrics.
     """
@@ -1536,37 +1308,26 @@ def run_weather_backtest(
     all_results = []
     balance = initial_balance
 
-    # Load real outcomes if requested
-    real_scenarios = []
-    if use_real_data:
-        real_outcomes = load_real_outcomes()
-        if real_outcomes:
-            for outcome in real_outcomes:
-                try:
-                    markets, true_temps = real_outcome_to_scenario(outcome)
-                    real_scenarios.append((markets, true_temps))
-                except Exception:
-                    continue  # skip malformed entries
+    # Load real historical scenarios (use cache if provided to avoid re-reading)
+    if _historical_cache is not None:
+        historical_scenarios = list(_historical_cache)
+    else:
+        historical_scenarios = load_historical_scenarios()
 
-    # Fetch settled Kalshi markets (always attempted — cached for 4 hours)
-    kalshi_scenarios = fetch_recent_kalshi_settlements()
-    # Weight real Kalshi scenarios 3x since they represent actual market behavior
-    weighted_kalshi = kalshi_scenarios * 3
+    if not historical_scenarios:
+        return {"error": "No historical scenarios loaded", "score": -999.0}
 
-    # Build combined scenario list: real outcomes first, then Kalshi 3x, then synthetic
-    all_real = real_scenarios + weighted_kalshi
-    n_real = len(all_real)
-    n_synthetic = max(0, n_scenarios - n_real)
+    # Shuffle with seed for multi-seed validation variety
+    rng.shuffle(historical_scenarios)
 
-    for scenario_idx in range(n_real + n_synthetic):
+    # Use all available scenarios (ignore n_scenarios for real data)
+    total_scenarios = len(historical_scenarios)
+
+    for scenario_idx in range(total_scenarios):
         if balance <= 1.0:
             break  # Account blown
 
-        # Use real/Kalshi scenario data first, then synthetic
-        if scenario_idx < n_real:
-            markets, true_temps = all_real[scenario_idx]
-        else:
-            markets, true_temps = generate_weather_scenario(rng)
+        markets, true_temps = historical_scenarios[scenario_idx]
 
         edges = detect_edges(markets, true_temps, params)
 
@@ -1605,138 +1366,215 @@ def run_weather_backtest(
 
         all_results.extend(settled)
 
+    # Walk-forward split: train on first 70%, test on last 30%
+    if walk_forward and all_results:
+        split_idx = int(len(all_results) * 0.70)
+        train_results = all_results[:split_idx]
+        test_results = all_results[split_idx:]
+
+        train_metrics = score_simulation(train_results, initial_balance=initial_balance)
+        test_metrics = score_simulation(test_results, initial_balance=initial_balance)
+
+        # Use overall metrics as the primary result
+        metrics = score_simulation(all_results, initial_balance=initial_balance)
+        metrics["train_score"] = train_metrics["score"]
+        metrics["test_score"] = test_metrics["score"]
+        return metrics
+
     metrics = score_simulation(all_results, initial_balance=initial_balance)
     return metrics
 
 
 # =============================================================================
-# CRYPTO BACKTEST
+# TAIL FADE BACKTEST: Price-based "buy NO on cheap YES" strategy
 # =============================================================================
 
-def run_crypto_backtest(
+# Series -> category mapping for tail fade filtering
+_SERIES_TO_CATEGORY = {
+    "KXHIGHNY": "weather",
+    "KXHIGHCHI": "weather",
+    "KXHIGHMIA": "weather",
+    "KXHIGHLA": "weather",
+    "KXHIGHDC": "weather",
+    "KXHIGHDEN": "weather",
+    "KXBTC": "crypto",
+    "KXETH": "crypto",
+    "KXNBAGAME": "nba",
+}
+
+
+def load_tail_fade_params() -> dict:
+    """Import candidate_strategy fresh and return tail fade params."""
+    for mod_name in list(sys.modules.keys()):
+        if "candidate_strategy" in mod_name:
+            del sys.modules[mod_name]
+
+    sys.path.insert(0, str(STRATEGY_FILE.parent))
+    try:
+        import candidate_strategy as strat
+        importlib.reload(strat)
+        return {
+            "max_price": getattr(strat, "TAIL_FADE_MAX_PRICE", 5),
+            "min_volume": getattr(strat, "TAIL_FADE_MIN_VOLUME", 100),
+            "weather_enabled": getattr(strat, "TAIL_FADE_WEATHER_ENABLED", 1),
+            "crypto_enabled": getattr(strat, "TAIL_FADE_CRYPTO_ENABLED", 1),
+            "nba_enabled": getattr(strat, "TAIL_FADE_NBA_ENABLED", 1),
+            "mid_low": getattr(strat, "TAIL_FADE_MID_LOW", 40),
+            "mid_high": getattr(strat, "TAIL_FADE_MID_HIGH", 55),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def run_tail_fade_backtest(
     seed: int = 42,
-    n_scenarios: int = 200,
+    walk_forward: bool = False,
+    _all_markets_cache: list | None = None,
 ) -> dict:
     """
-    Run a full crypto strategy backtest using simulated log-normal bucket markets.
+    Run a tail fade backtest against all historical settled markets.
 
-    1. Load candidate_strategy params
-    2. Generate n_scenarios crypto market days (3 assets × 13 buckets each)
-    3. Detect edges, scale positions to balance
-    4. Settle against drawn prices, accumulate P&L
-    5. Score with the same composite function as weather
+    Strategy: buy NO on markets where YES price is cheap (< max_price cents)
+    or in the mid-range fade zone (mid_low < yes_price < mid_high).
 
-    Returns dict with all metrics.
+    If the market settles NO, we profit (yes_price cents per contract).
+    If the market settles YES, we lose (100 - yes_price cents per contract).
+
+    Walk-forward: shuffle by close_time, train on 60%, test on 40%.
+
+    Returns dict with score_simulation() metrics.
     """
-    params = load_strategy_params()
-    if "error" in params:
-        return {"error": params["error"], "score": -999.0}
+    tf_params = load_tail_fade_params()
+    if "error" in tf_params:
+        return {"error": tf_params["error"], "score": -999.0}
 
-    initial_balance = 100.0
-    max_pos = params.get("crypto_max_position_dollars", 5.0)
+    max_price = tf_params["max_price"]
+    min_volume = tf_params["min_volume"]
+    weather_on = tf_params["weather_enabled"]
+    crypto_on = tf_params["crypto_enabled"]
+    nba_on = tf_params["nba_enabled"]
+    mid_low = tf_params["mid_low"]
+    mid_high = tf_params["mid_high"]
+
+    # Load all markets from historical file
+    if _all_markets_cache is not None:
+        all_markets = _all_markets_cache
+    else:
+        if not HISTORICAL_SETTLEMENTS_FILE.exists():
+            return {"error": "No historical settlements file", "score": -999.0}
+        try:
+            with open(HISTORICAL_SETTLEMENTS_FILE, "r") as f:
+                data = json.load(f)
+            all_markets = data.get("markets", [])
+        except (json.JSONDecodeError, IOError) as e:
+            return {"error": str(e), "score": -999.0}
+
+    # Filter to markets with price > 0 and volume > 0
+    valid = []
+    for m in all_markets:
+        prev_price = float(m.get("previous_price", "0"))
+        volume = float(m.get("volume", "0"))
+        if prev_price <= 0 or volume <= 0:
+            continue
+        if volume < min_volume:
+            continue
+
+        series = m.get("series", "")
+        category = _SERIES_TO_CATEGORY.get(series, "other")
+
+        # Category filter
+        if category == "weather" and not weather_on:
+            continue
+        if category == "crypto" and not crypto_on:
+            continue
+        if category == "nba" and not nba_on:
+            continue
+        if category == "other":
+            continue  # skip unknown categories
+
+        yes_price_cents = prev_price * 100.0
+        result = m.get("result", "")
+        if result not in ("yes", "no"):
+            continue
+
+        valid.append({
+            "yes_price_cents": yes_price_cents,
+            "result": result,
+            "close_time": m.get("close_time", ""),
+            "volume": volume,
+            "series": series,
+            "category": category,
+        })
+
+    if not valid:
+        return {"error": "No valid markets for tail fade", "score": -999.0}
+
+    # Sort by close_time for walk-forward, then shuffle with seed
+    valid.sort(key=lambda x: x["close_time"])
+
     rng = np.random.default_rng(seed)
-    all_results = []
-    balance = initial_balance
+    rng.shuffle(valid)
 
-    for _ in range(n_scenarios):
-        if balance <= 1.0:
-            break
+    # Apply tail fade strategy: generate trade results
+    all_trade_results = []
+    for m in valid:
+        yp = m["yes_price_cents"]
+        take_trade = False
 
-        markets, outcomes = generate_crypto_scenario(rng)
-        edges = detect_crypto_edges(markets, outcomes, params)
+        # Tail fade: YES price is very cheap -> buy NO
+        if yp <= max_price:
+            take_trade = True
 
-        edges.sort(key=lambda e: e.edge_cents, reverse=True)
-        daily_budget = balance * 0.20
-        spent = 0.0
-        filtered = []
+        # Mid-range fade: YES price in mid zone -> buy NO
+        if mid_low < yp < mid_high:
+            take_trade = True
 
-        for e in edges:
-            cost_per = (
-                e.market.yes_ask_cents / 100.0
-                if e.side == "buy_yes"
-                else (100 - e.market.yes_bid_cents) / 100.0
-            )
-            max_single = min(balance * 0.03, max_pos)
-            if cost_per > 0:
-                e.contracts = min(e.contracts, max(1, int(max_single / cost_per)))
-                e.cost_dollars = round(e.contracts * cost_per, 4)
-            if spent + e.cost_dollars > daily_budget:
-                continue
-            spent += e.cost_dollars
-            filtered.append(e)
+        if not take_trade:
+            continue
 
-        settled = settle_crypto_trades(filtered, outcomes)
-        for t in settled:
-            balance += t["pnl"]
-            t["balance_after"] = round(balance, 2)
-        all_results.extend(settled)
+        # Cost to buy NO = (100 - yes_price) cents per contract
+        no_cost_cents = 100.0 - yp
 
-    return score_simulation(all_results, initial_balance=initial_balance)
+        # Settlement
+        if m["result"] == "no":
+            # We bought NO and it settled NO: profit = yes_price cents
+            pnl = yp / 100.0  # convert cents to dollars (1 contract)
+        else:
+            # We bought NO and it settled YES: loss = no_cost cents
+            pnl = -no_cost_cents / 100.0
 
+        all_trade_results.append({
+            "city": m.get("category", ""),
+            "ticker": m.get("series", ""),
+            "type": "tail_fade",
+            "side": "buy_no",
+            "edge_cents": yp,  # the "edge" is the cheap YES price
+            "contracts": 1,
+            "cost": no_cost_cents / 100.0,
+            "pnl": round(pnl, 4),
+            "won": pnl > 0,
+            "true_temp": 0.0,
+            "forecast_temp": 0.0,
+        })
 
-# =============================================================================
-# SPORTS BACKTEST
-# =============================================================================
+    if not all_trade_results:
+        return {"error": "No tail fade trades generated", "score": -999.0}
 
-def run_sports_backtest(
-    seed: int = 42,
-    n_scenarios: int = 200,
-) -> dict:
-    """
-    Run a full sports strategy backtest using simulated NBA game markets.
+    # Walk-forward split: train on 60%, test on 40%
+    if walk_forward:
+        split_idx = int(len(all_trade_results) * 0.60)
+        train_results = all_trade_results[:split_idx]
+        test_results = all_trade_results[split_idx:]
 
-    1. Load candidate_strategy params
-    2. Generate n_scenarios NBA game days (5 games each)
-    3. Detect edges, scale positions to balance
-    4. Settle against drawn game outcomes, accumulate P&L
-    5. Score with the same composite function as weather
+        train_metrics = score_simulation(train_results, initial_balance=100.0)
+        test_metrics = score_simulation(test_results, initial_balance=100.0)
 
-    Returns dict with all metrics.
-    """
-    params = load_strategy_params()
-    if "error" in params:
-        return {"error": params["error"], "score": -999.0}
+        metrics = score_simulation(all_trade_results, initial_balance=100.0)
+        metrics["train_score"] = train_metrics["score"]
+        metrics["test_score"] = test_metrics["score"]
+        return metrics
 
-    initial_balance = 100.0
-    max_pos = params.get("sports_max_position_dollars", 5.0)
-    rng = np.random.default_rng(seed)
-    all_results = []
-    balance = initial_balance
-
-    for _ in range(n_scenarios):
-        if balance <= 1.0:
-            break
-
-        markets, outcomes = generate_sports_scenario(rng)
-        edges = detect_sports_edges(markets, params)
-
-        edges.sort(key=lambda e: e.edge_cents, reverse=True)
-        daily_budget = balance * 0.20
-        spent = 0.0
-        filtered = []
-
-        for e in edges:
-            cost_per = (
-                e.market.yes_ask_cents / 100.0
-                if e.side == "buy_yes"
-                else (100 - e.market.yes_bid_cents) / 100.0
-            )
-            max_single = min(balance * 0.03, max_pos)
-            if cost_per > 0:
-                e.contracts = min(e.contracts, max(1, int(max_single / cost_per)))
-                e.cost_dollars = round(e.contracts * cost_per, 4)
-            if spent + e.cost_dollars > daily_budget:
-                continue
-            spent += e.cost_dollars
-            filtered.append(e)
-
-        settled = settle_sports_trades(filtered, outcomes)
-        for t in settled:
-            balance += t["pnl"]
-            t["balance_after"] = round(balance, 2)
-        all_results.extend(settled)
-
-    return score_simulation(all_results, initial_balance=initial_balance)
+    return score_simulation(all_trade_results, initial_balance=100.0)
 
 
 # =============================================================================
@@ -1782,25 +1620,129 @@ def get_current_value(source: str, param_name: str):
         if stripped.startswith(f"{param_name} =") or stripped.startswith(f"{param_name}="):
             val_part = stripped.split("=", 1)[1].split("#")[0].strip()
             try:
-                return eval(val_part)
+                return ast.literal_eval(val_part)
             except Exception:
                 return val_part
     return None
 
 
-_STRATEGY_MUTATION_SPACES = {
-    "weather": MUTATION_SPACE,
-    "crypto": CRYPTO_MUTATION_SPACE,
-    "sports": SPORTS_MUTATION_SPACE,
-}
-
-
-def random_mutation(source: str, strategy: str = "weather") -> tuple[str, object, str]:
-    """Pick a random parameter and a random value for it from the strategy's mutation space."""
-    space = _STRATEGY_MUTATION_SPACES.get(strategy, MUTATION_SPACE)
-    param = random.choice(list(space.keys()))
-    new_val = random.choice(space[param])
+def random_mutation(source: str) -> tuple[str, object, str]:
+    """Pick a random parameter and a random value for it."""
+    param = random.choice(list(MUTATION_SPACE.keys()))
+    new_val = random.choice(MUTATION_SPACE[param])
     return param, new_val, "Random exploration"
+
+
+# =============================================================================
+# LLM-GUIDED MUTATIONS
+# =============================================================================
+
+def llm_guided_mutation(
+    source: str,
+    history: list[dict],
+    results_log_path: Path,
+) -> tuple[str, object, str]:
+    """
+    Use Claude (Haiku) to suggest the next parameter mutation based on
+    recent experiment history. Falls back to random_mutation() on any error.
+
+    Reads the last 15 entries from the results log, formats them as context,
+    and asks Claude which parameter to change next and why.
+
+    Returns:
+        (param_name, new_value, reason)
+    """
+    if _anthropic_module is None or not config.ANTHROPIC_API_KEY:
+        return random_mutation(source)
+
+    # Load last 15 entries from results log
+    recent_entries = []
+    try:
+        if results_log_path.exists():
+            lines = results_log_path.read_text().strip().split("\n")
+            for line in lines[-15:]:
+                if line.strip():
+                    try:
+                        recent_entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except (IOError, OSError):
+        pass
+
+    if not recent_entries:
+        return random_mutation(source)
+
+    # Format experiment history for context
+    history_text = ""
+    for entry in recent_entries:
+        kept = entry.get("kept", False)
+        param = entry.get("parameter", "?")
+        old_v = entry.get("old_value", "?")
+        new_v = entry.get("new_value", "?")
+        score = entry.get("metrics", {}).get("score", "?")
+        result_str = "IMPROVED" if kept else "REVERTED"
+        history_text += f"  {param}: {old_v} -> {new_v} | score={score} | {result_str}\n"
+
+    # Format valid parameter space
+    param_space_text = json.dumps(MUTATION_SPACE, indent=2)
+
+    prompt = f"""You are optimizing a weather trading strategy. Here are the last {len(recent_entries)} experiment results showing which parameter changes improved or worsened the score:
+
+{history_text}
+
+Here are the valid parameters and their allowed values:
+{param_space_text}
+
+Based on these patterns, suggest the SINGLE best parameter to change next. Consider:
+- Which parameters have shown improvement trends when increased/decreased?
+- Which parameters haven't been explored much yet?
+- What direction (higher/lower) tends to help?
+
+Respond with ONLY a JSON object, no other text:
+{{"parameter": "PARAM_NAME", "value": NEW_VALUE, "reason": "brief explanation"}}"""
+
+    try:
+        client = _anthropic_module.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        response_text = response.content[0].text.strip()
+
+        # Parse JSON from response (handle markdown code blocks)
+        if "```" in response_text:
+            # Extract content between code fences
+            json_str = response_text.split("```")[1]
+            if json_str.startswith("json"):
+                json_str = json_str[4:]
+            json_str = json_str.strip()
+        else:
+            json_str = response_text
+
+        result = json.loads(json_str)
+        param_name = result["parameter"]
+        new_value = result["value"]
+        reason = result.get("reason", "LLM-guided mutation")
+
+        # Validate the suggestion against MUTATION_SPACE
+        if param_name not in MUTATION_SPACE:
+            return random_mutation(source)
+
+        # Find the closest valid value in MUTATION_SPACE
+        valid_values = MUTATION_SPACE[param_name]
+        if new_value not in valid_values:
+            # Snap to nearest valid value
+            if isinstance(new_value, (int, float)):
+                new_value = min(valid_values, key=lambda v: abs(v - new_value))
+            else:
+                new_value = random.choice(valid_values)
+
+        return param_name, new_value, f"LLM-guided: {reason}"
+
+    except Exception:
+        return random_mutation(source)
 
 
 # =============================================================================
@@ -1870,14 +1812,16 @@ def run_research(
     n_scenarios: int = 200,
     verbose: bool = True,
     use_real_data: bool = False,
+    walk_forward: bool = False,
+    no_claude: bool = False,
 ):
     """
     Run the Weather AutoResearch loop.
 
     For each iteration:
     1. Read current candidate_strategy.py
-    2. Pick a random parameter mutation
-    3. Apply mutation, run weather backtest
+    2. Pick a mutation (LLM-guided 70%, random 30%)
+    3. Apply mutation, run weather backtest with multi-seed validation
     4. If score improves: keep and git commit
     5. If score worsens: revert
     6. Log everything
@@ -1888,59 +1832,120 @@ def run_research(
         verbose: Print progress to terminal
         use_real_data: If True, incorporate real settlement outcomes from
                        real_outcomes.json for the first N scenarios
+        walk_forward: If True, use walk-forward validation (70/30 split)
+        no_claude: If True, skip LLM-guided mutations (random only)
     """
     max_iterations = max_iterations or config.AUTORESEARCH_MAX_ITERATIONS
 
     console.print("\n[bold cyan]================================================================[/bold cyan]")
-    console.print("[bold cyan]  WEATHER AUTORESEARCH: Forecast Arbitrage Optimization Loop  [/bold cyan]")
+    console.print("[bold cyan]  AUTORESEARCH: Multi-Strategy Optimization Loop              [/bold cyan]")
     console.print("[bold cyan]================================================================[/bold cyan]\n")
 
-    # Report real data status
-    if use_real_data:
-        real_outcomes = load_real_outcomes()
-        if real_outcomes:
-            console.print(
-                f"[green]Real data mode: {len(real_outcomes)} real outcomes loaded "
-                f"from {REAL_OUTCOMES_FILE.name}[/green]"
-            )
-        else:
-            console.print(
-                "[yellow]Real data mode requested but no weather outcomes found -- "
-                "falling back to 100% synthetic[/yellow]"
-            )
-
-    # Report Kalshi settled data status (always fetched, independent of --use-real-data)
-    kalshi_preview = fetch_recent_kalshi_settlements()
-    if kalshi_preview:
+    # Load historical scenarios once (shared across all backtests this session)
+    historical_scenarios = load_historical_scenarios()
+    if historical_scenarios:
         console.print(
-            f"[green]Kalshi settled markets: {len(kalshi_preview)} scenarios "
-            f"(weighted 3x = {len(kalshi_preview) * 3} effective scenarios)[/green]"
+            f"[green]Historical data: {len(historical_scenarios)} real settled weather scenarios "
+            f"loaded from {HISTORICAL_SETTLEMENTS_FILE.name}[/green]"
         )
     else:
         console.print(
-            "[dim]No settled Kalshi weather markets available -- using synthetic only[/dim]"
+            "[red]No historical weather scenarios found -- cannot run weather backtest without real data[/red]"
         )
-
-    # Baseline: score current strategy
-    console.print("[dim]Running baseline weather backtest...[/dim]")
-    baseline = run_weather_backtest(
-        seed=42, n_scenarios=n_scenarios, use_real_data=use_real_data
-    )
-    if "error" in baseline:
-        console.print(f"[red]Baseline failed: {baseline['error']}[/red]")
         return
 
-    console.print(f"[green]Baseline score: {baseline['score']:.4f}[/green]")
+    # Load raw markets for tail fade backtest (all categories, not just weather)
+    tail_fade_markets_cache = None
+    try:
+        if HISTORICAL_SETTLEMENTS_FILE.exists():
+            with open(HISTORICAL_SETTLEMENTS_FILE, "r") as f:
+                _tf_data = json.load(f)
+            tail_fade_markets_cache = _tf_data.get("markets", [])
+            n_tf = len([
+                m for m in tail_fade_markets_cache
+                if float(m.get("previous_price", "0")) > 0
+                and float(m.get("volume", "0")) > 0
+            ])
+            console.print(
+                f"[green]Tail fade data: {n_tf} markets with price+volume "
+                f"(all categories)[/green]"
+            )
+    except Exception as e:
+        console.print(f"[yellow]Failed to load tail fade data: {e}[/yellow]")
+
+    # Report mutation mode
+    llm_available = (
+        not no_claude
+        and _anthropic_module is not None
+        and config.ANTHROPIC_API_KEY
+    )
+    if llm_available:
+        console.print("[green]Mutation mode: LLM-guided (70%) + random (30%)[/green]")
+    else:
+        reason = "disabled" if no_claude else "anthropic SDK/key unavailable"
+        console.print(f"[dim]Mutation mode: random only ({reason})[/dim]")
+
+    if walk_forward:
+        console.print("[green]Walk-forward validation: enabled (70/30 split)[/green]")
+
+    # Baseline: score current weather strategy
+    console.print("[dim]Running baseline weather backtest...[/dim]")
+    baseline = run_weather_backtest(
+        seed=42, n_scenarios=n_scenarios, use_real_data=use_real_data,
+        walk_forward=walk_forward, _historical_cache=historical_scenarios,
+    )
+    if "error" in baseline:
+        console.print(f"[red]Weather baseline failed: {baseline['error']}[/red]")
+        return
+
+    console.print(f"[green]Weather baseline score: {baseline['score']:.4f}[/green]")
     console.print(
         f"  Sortino: {baseline['sortino']:.3f} | "
         f"ROI: {baseline['roi_pct']:.2f}% | "
         f"Win: {baseline['win_rate']:.1f}% | "
         f"MaxDD: {baseline['max_dd_pct']:.2f}% | "
         f"Trades: {baseline['total_trades']} | "
-        f"PF: {baseline['profit_factor']:.2f}\n"
+        f"PF: {baseline['profit_factor']:.2f}"
     )
+    if walk_forward and "train_score" in baseline:
+        console.print(
+            f"  Walk-forward: train={baseline['train_score']:.4f} "
+            f"test={baseline['test_score']:.4f}"
+        )
+
+    # Baseline: score current tail fade strategy
+    console.print("[dim]Running baseline tail fade backtest...[/dim]")
+    tf_baseline = run_tail_fade_backtest(
+        seed=42, walk_forward=walk_forward,
+        _all_markets_cache=tail_fade_markets_cache,
+    )
+    if "error" in tf_baseline:
+        console.print(f"[yellow]Tail fade baseline: {tf_baseline.get('error', 'unknown')}[/yellow]")
+        tf_baseline_score = -999.0
+    else:
+        tf_baseline_score = tf_baseline["score"]
+        console.print(f"[green]Tail fade baseline score: {tf_baseline['score']:.4f}[/green]")
+        console.print(
+            f"  Sortino: {tf_baseline['sortino']:.3f} | "
+            f"ROI: {tf_baseline['roi_pct']:.2f}% | "
+            f"Win: {tf_baseline['win_rate']:.1f}% | "
+            f"MaxDD: {tf_baseline['max_dd_pct']:.2f}% | "
+            f"Trades: {tf_baseline['total_trades']} | "
+            f"PF: {tf_baseline['profit_factor']:.2f}"
+        )
+        if walk_forward and "train_score" in tf_baseline:
+            console.print(
+                f"  Walk-forward: train={tf_baseline['train_score']:.4f} "
+                f"test={tf_baseline['test_score']:.4f}"
+            )
+    console.print()
 
     best_score = baseline["score"]
+    best_train_score = baseline.get("train_score", best_score)
+    best_test_score = baseline.get("test_score", best_score)
+    best_tf_score = tf_baseline_score
+    best_tf_train_score = tf_baseline.get("train_score", tf_baseline_score) if "error" not in tf_baseline else -999.0
+    best_tf_test_score = tf_baseline.get("test_score", tf_baseline_score) if "error" not in tf_baseline else -999.0
     improvements = 0
     history = []
 
@@ -1958,13 +1963,41 @@ def run_research(
         TextColumn("[progress.description]{task.description}"),
         console=console,
     ) as progress:
-        task = progress.add_task("Weather research loop", total=max_iterations)
+        task = progress.add_task("Multi-strategy research loop", total=max_iterations)
+
+        # Separate mutation spaces for targeted iteration
+        weather_params = set(MUTATION_SPACE.keys()) - {
+            k for k in MUTATION_SPACE if k.startswith("TAIL_FADE_")
+        }
+        tail_fade_params = {
+            k for k in MUTATION_SPACE if k.startswith("TAIL_FADE_")
+        }
 
         for i in range(1, max_iterations + 1):
             source = read_strategy_file()
 
-            # Pick mutation
-            param, new_val, reason = random_mutation(source)
+            # Alternate: odd iterations = weather, even = tail fade
+            is_tail_fade_iter = (i % 2 == 0) and tail_fade_markets_cache is not None
+
+            if is_tail_fade_iter:
+                mode_label = "tail_fade"
+                # Pick from tail fade params only
+                param = random.choice(list(tail_fade_params))
+                new_val = random.choice(MUTATION_SPACE[param])
+                reason = "Random tail fade exploration"
+            else:
+                mode_label = "weather"
+                # Pick mutation: LLM-guided 70% of the time, random 30%
+                if llm_available and random.random() < 0.70:
+                    try:
+                        param, new_val, reason = llm_guided_mutation(
+                            source, history, RESULTS_LOG
+                        )
+                    except Exception:
+                        param, new_val, reason = random_mutation(source)
+                else:
+                    param, new_val, reason = random_mutation(source)
+
             old_val = get_current_value(source, param)
 
             # Skip if same value
@@ -1972,31 +2005,101 @@ def run_research(
                 progress.update(task, advance=1)
                 continue
 
-            progress.update(task, description=f"Iter {i}/{max_iterations}: {param}={new_val}")
+            progress.update(
+                task,
+                description=f"Iter {i}/{max_iterations} [{mode_label}]: {param}={new_val}",
+            )
 
             # Apply mutation
             new_source = mutate_parameter(source, param, new_val)
             write_strategy_file(new_source)
 
-            # Run weather backtest with slightly different seed per iteration
-            metrics = run_weather_backtest(
-                seed=42 + i, n_scenarios=n_scenarios, use_real_data=use_real_data
-            )
-            if "error" in metrics:
+            # Multi-seed validation: run 3 backtests with different seeds
+            # and use the AVERAGE score to reduce variance / overfitting
+            seeds = [42 + i, 42 + i + 1000, 42 + i + 2000]
+            seed_scores = []
+            first_metrics = None
+
+            if is_tail_fade_iter:
+                # Run tail fade backtest
+                for s in seeds:
+                    m = run_tail_fade_backtest(
+                        seed=s, walk_forward=walk_forward,
+                        _all_markets_cache=tail_fade_markets_cache,
+                    )
+                    if "error" not in m:
+                        seed_scores.append(m)
+                        if first_metrics is None:
+                            first_metrics = m
+            else:
+                # Run weather backtest
+                for s in seeds:
+                    m = run_weather_backtest(
+                        seed=s, n_scenarios=n_scenarios, use_real_data=use_real_data,
+                        walk_forward=walk_forward, _historical_cache=historical_scenarios,
+                    )
+                    if "error" not in m:
+                        seed_scores.append(m)
+                        if first_metrics is None:
+                            first_metrics = m
+
+            if not seed_scores:
                 write_strategy_file(source)  # revert on error
                 progress.update(task, advance=1)
                 continue
 
-            new_score = metrics["score"]
+            # Use first run for detailed metrics display, average for score
+            metrics = first_metrics
+            new_score = sum(s["score"] for s in seed_scores) / len(seed_scores)
 
-            # Decision: keep or revert
-            kept = new_score > best_score
+            # Decision: keep or revert (compare against mode-specific best)
+            if is_tail_fade_iter:
+                ref_best = best_tf_score
+            else:
+                ref_best = best_score
+
+            if walk_forward and "train_score" in metrics:
+                avg_train = sum(
+                    s.get("train_score", s["score"]) for s in seed_scores
+                ) / len(seed_scores)
+                avg_test = sum(
+                    s.get("test_score", s["score"]) for s in seed_scores
+                ) / len(seed_scores)
+                if is_tail_fade_iter:
+                    kept = (
+                        avg_train > best_tf_train_score
+                        and avg_test > best_tf_test_score
+                    )
+                else:
+                    kept = (
+                        avg_train > best_train_score
+                        and avg_test > best_test_score
+                    )
+            else:
+                kept = new_score > ref_best
 
             if kept:
-                best_score = new_score
+                if is_tail_fade_iter:
+                    best_tf_score = new_score
+                    if walk_forward and "train_score" in metrics:
+                        best_tf_train_score = sum(
+                            s.get("train_score", s["score"]) for s in seed_scores
+                        ) / len(seed_scores)
+                        best_tf_test_score = sum(
+                            s.get("test_score", s["score"]) for s in seed_scores
+                        ) / len(seed_scores)
+                else:
+                    best_score = new_score
+                    if walk_forward and "train_score" in metrics:
+                        best_train_score = sum(
+                            s.get("train_score", s["score"]) for s in seed_scores
+                        ) / len(seed_scores)
+                        best_test_score = sum(
+                            s.get("test_score", s["score"]) for s in seed_scores
+                        ) / len(seed_scores)
                 improvements += 1
                 git_commit(
-                    f"WeatherResearch iter {i}: {param}={new_val} "
+                    f"Research iter {i} [{mode_label}]: {param}={new_val} "
                     f"score={new_score:.4f} sortino={metrics['sortino']:.3f}"
                 )
                 if alert_research_improvement is not None:
@@ -2006,7 +2109,7 @@ def run_research(
                         pass
                 if verbose:
                     console.print(
-                        f"  [green]+ Iter {i}: {param} {old_val}->{new_val} "
+                        f"  [green]+ Iter {i} [{mode_label}]: {param} {old_val}->{new_val} "
                         f"score={new_score:.4f} sortino={metrics['sortino']:.3f} "
                         f"roi={metrics['roi_pct']:.1f}% win={metrics['win_rate']:.0f}% KEPT[/green]"
                     )
@@ -2015,8 +2118,8 @@ def run_research(
                 git_revert()
                 if verbose and i % 5 == 0:
                     console.print(
-                        f"  [dim]- Iter {i}: {param} {old_val}->{new_val} "
-                        f"score={new_score:.4f} (vs {best_score:.4f}) REVERTED[/dim]"
+                        f"  [dim]- Iter {i} [{mode_label}]: {param} {old_val}->{new_val} "
+                        f"score={new_score:.4f} (vs {ref_best:.4f}) REVERTED[/dim]"
                     )
 
             # Log
@@ -2028,6 +2131,7 @@ def run_research(
                 "new_value": new_val,
                 "score": new_score,
                 "kept": kept,
+                "mode": mode_label,
             })
 
             progress.update(task, advance=1)
@@ -2035,17 +2139,20 @@ def run_research(
 
     # Final summary
     console.print(f"\n[bold cyan]{'=' * 65}[/bold cyan]")
-    console.print(f"[bold]Weather Research Complete: {max_iterations} iterations[/bold]")
+    console.print(f"[bold]Multi-Strategy Research Complete: {max_iterations} iterations[/bold]")
     console.print(f"  Improvements found: {improvements}")
-    console.print(f"  Best score: {best_score:.4f} (baseline was {baseline['score']:.4f})")
+    console.print(f"  Best weather score: {best_score:.4f} (baseline was {baseline['score']:.4f})")
+    console.print(f"  Best tail fade score: {best_tf_score:.4f} (baseline was {tf_baseline_score:.4f})")
 
+    # Final weather backtest
     final = run_weather_backtest(
-        seed=42, n_scenarios=n_scenarios, use_real_data=use_real_data
+        seed=42, n_scenarios=n_scenarios, use_real_data=use_real_data,
+        walk_forward=walk_forward, _historical_cache=historical_scenarios,
     )
     if "error" in final:
-        console.print(f"[red]Final backtest failed: {final['error']}[/red]")
+        console.print(f"[red]Final weather backtest failed: {final['error']}[/red]")
     else:
-        console.print(f"\n[bold]Final Strategy Performance:[/bold]")
+        console.print(f"\n[bold]Final Weather Strategy Performance:[/bold]")
         console.print(f"  Sortino:       {final['sortino']:.3f}")
         console.print(f"  ROI:           {final['roi_pct']:.2f}%")
         console.print(f"  Win Rate:      {final['win_rate']:.1f}%")
@@ -2053,10 +2160,34 @@ def run_research(
         console.print(f"  Profit Factor: {final['profit_factor']:.2f}")
         console.print(f"  Total Trades:  {final['total_trades']}")
         console.print(f"  Total P&L:     ${final['total_pnl']:.2f}")
+        if walk_forward and "train_score" in final:
+            console.print(f"  Train Score:   {final['train_score']:.4f}")
+            console.print(f"  Test Score:    {final['test_score']:.4f}")
+
+    # Final tail fade backtest
+    tf_final = run_tail_fade_backtest(
+        seed=42, walk_forward=walk_forward,
+        _all_markets_cache=tail_fade_markets_cache,
+    )
+    if "error" in tf_final:
+        console.print(f"[yellow]Final tail fade backtest: {tf_final.get('error', 'unknown')}[/yellow]")
+    else:
+        console.print(f"\n[bold]Final Tail Fade Strategy Performance:[/bold]")
+        console.print(f"  Sortino:       {tf_final['sortino']:.3f}")
+        console.print(f"  ROI:           {tf_final['roi_pct']:.2f}%")
+        console.print(f"  Win Rate:      {tf_final['win_rate']:.1f}%")
+        console.print(f"  Max Drawdown:  {tf_final['max_dd_pct']:.2f}%")
+        console.print(f"  Profit Factor: {tf_final['profit_factor']:.2f}")
+        console.print(f"  Total Trades:  {tf_final['total_trades']}")
+        console.print(f"  Total P&L:     ${tf_final['total_pnl']:.2f}")
+        if walk_forward and "train_score" in tf_final:
+            console.print(f"  Train Score:   {tf_final['train_score']:.4f}")
+            console.print(f"  Test Score:    {tf_final['test_score']:.4f}")
+
     console.print(f"\n  Results log: {RESULTS_LOG}")
 
     # Show current best params
-    console.print(f"\n[bold]Optimized Parameters:[/bold]")
+    console.print(f"\n[bold]Optimized Weather Parameters:[/bold]")
     params = load_strategy_params()
     if "error" not in params:
         console.print(f"  FORECAST_STDEV: {params['forecast_stdev']}")
@@ -2065,6 +2196,16 @@ def run_research(
         console.print(f"  NWS_WEIGHT: {params['nws_official_weight']}")
         console.print(f"  CITY_WEIGHTS: {params['city_weights']}")
         console.print(f"  BUCKET_MULT: {params['bucket_multiplier']} / THRESHOLD_MULT: {params['threshold_multiplier']}")
+
+    tf_params = load_tail_fade_params()
+    if "error" not in tf_params:
+        console.print(f"\n[bold]Optimized Tail Fade Parameters:[/bold]")
+        console.print(f"  MAX_PRICE: {tf_params['max_price']}c")
+        console.print(f"  MIN_VOLUME: {tf_params['min_volume']}")
+        console.print(f"  WEATHER: {'on' if tf_params['weather_enabled'] else 'off'} | "
+                      f"CRYPTO: {'on' if tf_params['crypto_enabled'] else 'off'} | "
+                      f"NBA: {'on' if tf_params['nba_enabled'] else 'off'}")
+        console.print(f"  MID_FADE: {tf_params['mid_low']}-{tf_params['mid_high']}c")
 
     console.print(f"[bold cyan]{'=' * 65}[/bold cyan]\n")
 
@@ -2077,223 +2218,32 @@ def run_research(
         pass  # Non-critical
 
 
-def _run_research_loop(
-    strategy: str,
-    backtest_fn,
-    label: str,
-    max_iterations: int,
-    n_scenarios: int,
-    verbose: bool,
-):
-    """
-    Generic research loop body shared by weather, crypto, and sports variants.
-
-    Args:
-        strategy:     "weather", "crypto", or "sports"
-        backtest_fn:  callable(seed, n_scenarios) -> metrics dict
-        label:        display name for console output
-        max_iterations, n_scenarios, verbose: as in run_research
-    """
-    console.print(f"\n[bold cyan]{'=' * 65}[/bold cyan]")
-    console.print(f"[bold cyan]  {label.upper()} AUTORESEARCH: Strategy Optimization Loop  [/bold cyan]")
-    console.print(f"[bold cyan]{'=' * 65}[/bold cyan]\n")
-
-    console.print(f"[dim]Running baseline {strategy} backtest...[/dim]")
-    baseline = backtest_fn(seed=42, n_scenarios=n_scenarios)
-    if "error" in baseline:
-        console.print(f"[red]Baseline failed: {baseline['error']}[/red]")
-        return
-
-    console.print(f"[green]Baseline score: {baseline['score']:.4f}[/green]")
-    console.print(
-        f"  Sortino: {baseline['sortino']:.3f} | "
-        f"ROI: {baseline['roi_pct']:.2f}% | "
-        f"Win: {baseline['win_rate']:.1f}% | "
-        f"MaxDD: {baseline['max_dd_pct']:.2f}% | "
-        f"Trades: {baseline['total_trades']} | "
-        f"PF: {baseline['profit_factor']:.2f}\n"
-    )
-
-    best_score = baseline["score"]
-    improvements = 0
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task(f"{label} research loop", total=max_iterations)
-
-        for i in range(1, max_iterations + 1):
-            source = read_strategy_file()
-            param, new_val, _ = random_mutation(source, strategy=strategy)
-            old_val = get_current_value(source, param)
-
-            if old_val == new_val:
-                progress.update(task, advance=1)
-                continue
-
-            progress.update(task, description=f"Iter {i}/{max_iterations}: {param}={new_val}")
-
-            new_source = mutate_parameter(source, param, new_val)
-            write_strategy_file(new_source)
-
-            metrics = backtest_fn(seed=42 + i, n_scenarios=n_scenarios)
-            if "error" in metrics:
-                write_strategy_file(source)
-                progress.update(task, advance=1)
-                continue
-
-            new_score = metrics["score"]
-            kept = new_score > best_score
-
-            if kept:
-                best_score = new_score
-                improvements += 1
-                git_commit(
-                    f"{label}Research iter {i}: {param}={new_val} "
-                    f"score={new_score:.4f} sortino={metrics['sortino']:.3f}"
-                )
-                if alert_research_improvement is not None:
-                    try:
-                        alert_research_improvement(param, old_val, new_val, new_score)
-                    except Exception:
-                        pass
-                if verbose:
-                    console.print(
-                        f"  [green]+ Iter {i}: {param} {old_val}->{new_val} "
-                        f"score={new_score:.4f} sortino={metrics['sortino']:.3f} "
-                        f"roi={metrics['roi_pct']:.1f}% win={metrics['win_rate']:.0f}% KEPT[/green]"
-                    )
-            else:
-                write_strategy_file(source)
-                git_revert()
-                if verbose and i % 5 == 0:
-                    console.print(
-                        f"  [dim]- Iter {i}: {param} {old_val}->{new_val} "
-                        f"score={new_score:.4f} (vs {best_score:.4f}) REVERTED[/dim]"
-                    )
-
-            log_result(i, param, old_val, new_val, metrics, kept)
-            progress.update(task, advance=1)
-            time.sleep(0.05)
-
-    console.print(f"\n[bold cyan]{'=' * 65}[/bold cyan]")
-    console.print(f"[bold]{label} Research Complete: {max_iterations} iterations[/bold]")
-    console.print(f"  Improvements found: {improvements}")
-    console.print(f"  Best score: {best_score:.4f} (baseline was {baseline['score']:.4f})")
-
-    final = backtest_fn(seed=42, n_scenarios=n_scenarios)
-    if "error" not in final:
-        console.print(f"\n[bold]Final Strategy Performance:[/bold]")
-        console.print(f"  Sortino:       {final['sortino']:.3f}")
-        console.print(f"  ROI:           {final['roi_pct']:.2f}%")
-        console.print(f"  Win Rate:      {final['win_rate']:.1f}%")
-        console.print(f"  Max Drawdown:  {final['max_dd_pct']:.2f}%")
-        console.print(f"  Profit Factor: {final['profit_factor']:.2f}")
-        console.print(f"  Total Trades:  {final['total_trades']}")
-        console.print(f"  Total P&L:     ${final['total_pnl']:.2f}")
-    console.print(f"[bold cyan]{'=' * 65}[/bold cyan]\n")
-
-
-def run_crypto_research(
-    max_iterations: int = None,
-    n_scenarios: int = 200,
-    verbose: bool = True,
-):
-    """
-    Run the Crypto AutoResearch loop.
-
-    Optimizes: CRYPTO_MIN_EDGE_CENTS, CRYPTO_VOL_BIAS_*, CRYPTO_CENTER_BUCKET_BIAS,
-               CRYPTO_TAIL_BUCKET_MULTIPLIER, CRYPTO_CONTRACTS_PER_TRADE,
-               CRYPTO_MAX_POSITION_DOLLARS.
-    """
-    max_iterations = max_iterations or config.AUTORESEARCH_MAX_ITERATIONS
-    _run_research_loop(
-        strategy="crypto",
-        backtest_fn=run_crypto_backtest,
-        label="Crypto",
-        max_iterations=max_iterations,
-        n_scenarios=n_scenarios,
-        verbose=verbose,
-    )
-    # Regenerate strategy doc after research
-    try:
-        sys.path.insert(0, str(Path(__file__).parent.parent))
-        from strategy_doc import generate_strategy_doc
-        generate_strategy_doc()
-    except Exception:
-        pass
-
-
-def run_sports_research(
-    max_iterations: int = None,
-    n_scenarios: int = 200,
-    verbose: bool = True,
-):
-    """
-    Run the Sports AutoResearch loop.
-
-    Optimizes: SPORTS_HOME_COURT_ADVANTAGE, SPORTS_NBA_GAME_STDEV,
-               SPORTS_RECENT_FORM_WEIGHT, SPORTS_MIN_EDGE_PCT,
-               SPORTS_CONTRACTS_PER_TRADE, SPORTS_MAX_POSITION_DOLLARS.
-    """
-    max_iterations = max_iterations or config.AUTORESEARCH_MAX_ITERATIONS
-    _run_research_loop(
-        strategy="sports",
-        backtest_fn=run_sports_backtest,
-        label="Sports",
-        max_iterations=max_iterations,
-        n_scenarios=n_scenarios,
-        verbose=verbose,
-    )
-    try:
-        sys.path.insert(0, str(Path(__file__).parent.parent))
-        from strategy_doc import generate_strategy_doc
-        generate_strategy_doc()
-    except Exception:
-        pass
-
-
 # =============================================================================
 # CLI ENTRY POINT
 # =============================================================================
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="AutoResearch Loop")
+    parser = argparse.ArgumentParser(description="Multi-Strategy AutoResearch Loop")
     parser.add_argument("--iterations", type=int, default=50, help="Number of experiments")
-    parser.add_argument("--scenarios", type=int, default=200, help="Days/games per backtest")
+    parser.add_argument("--scenarios", type=int, default=200, help="Weather days per backtest")
     parser.add_argument("--quiet", action="store_true", help="Less output")
     parser.add_argument("--no-claude", action="store_true", help="Random mutations only (no Claude API)")
     parser.add_argument(
-        "--strategy",
-        choices=["weather", "crypto", "sports", "all"],
-        default="weather",
-        help="Which strategy to optimize (default: weather)",
+        "--use-real-data", action="store_true",
+        help="Incorporate real settlement outcomes from real_outcomes.json"
     )
     parser.add_argument(
-        "--use-real-data", action="store_true",
-        help="Incorporate real settlement outcomes from real_outcomes.json (weather only)"
+        "--walk-forward", action="store_true",
+        help="Enable walk-forward validation (70/30 train/test split)"
     )
     args = parser.parse_args()
 
-    if args.strategy == "weather" or args.strategy == "all":
-        run_research(
-            max_iterations=args.iterations,
-            n_scenarios=args.scenarios,
-            verbose=not args.quiet,
-            use_real_data=args.use_real_data,
-        )
-    if args.strategy == "crypto" or args.strategy == "all":
-        run_crypto_research(
-            max_iterations=args.iterations,
-            n_scenarios=args.scenarios,
-            verbose=not args.quiet,
-        )
-    if args.strategy == "sports" or args.strategy == "all":
-        run_sports_research(
-            max_iterations=args.iterations,
-            n_scenarios=args.scenarios,
-            verbose=not args.quiet,
-        )
+    run_research(
+        max_iterations=args.iterations,
+        n_scenarios=args.scenarios,
+        verbose=not args.quiet,
+        use_real_data=args.use_real_data,
+        walk_forward=args.walk_forward,
+        no_claude=args.no_claude,
+    )

@@ -3,9 +3,11 @@ risk_manager.py — Position sizing, Kelly criterion, and loss caps.
 ALL DEFAULTS ARE EXTREMELY CONSERVATIVE for a $100 account.
 """
 
+import json
 import math
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import config
 
@@ -60,17 +62,56 @@ class RiskManager:
 
     def __init__(self, account_balance: float = None):
         self.balance = account_balance or config.ACCOUNT_BALANCE
-        self.daily_state = DailyRiskState(date=self._today())
+        self.daily_state = self._load_state()
         self.trade_log: list[dict] = []
 
     def _today(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _state_file_path() -> Path:
+        return config.OUTPUT_DIR / "daily_risk_state.json"
+
+    def _load_state(self) -> DailyRiskState:
+        """Load daily risk state from disk, or start fresh."""
+        path = self._state_file_path()
+        today = self._today()
+        try:
+            if path.exists():
+                data = json.loads(path.read_text())
+                if data.get("date") == today:
+                    return DailyRiskState(
+                        date=today,
+                        realized_pnl=float(data.get("realized_pnl", 0.0)),
+                        open_positions=int(data.get("open_positions", 0)),
+                        trades_today=int(data.get("trades_today", 0)),
+                        blocked=bool(data.get("blocked", False)),
+                    )
+        except (json.JSONDecodeError, KeyError, ValueError, OSError):
+            pass  # Corrupted or unreadable — start fresh
+        return DailyRiskState(date=today)
+
+    def _save_state(self):
+        """Persist daily risk state to disk."""
+        path = self._state_file_path()
+        data = {
+            "date": self.daily_state.date,
+            "realized_pnl": self.daily_state.realized_pnl,
+            "trades_today": self.daily_state.trades_today,
+            "open_positions": self.daily_state.open_positions,
+            "blocked": self.daily_state.blocked,
+        }
+        try:
+            path.write_text(json.dumps(data, indent=2) + "\n")
+        except OSError:
+            pass  # Non-fatal — state will reload next time
 
     def _reset_daily_if_needed(self):
         """Reset daily counters if it's a new day."""
         today = self._today()
         if self.daily_state.date != today:
             self.daily_state = DailyRiskState(date=today)
+            self._save_state()
 
     def evaluate_trade(self, proposal: TradeProposal) -> ApprovedTrade | None:
         """
@@ -83,6 +124,7 @@ class RiskManager:
         max_daily_loss = self.balance * config.MAX_DAILY_LOSS_PCT
         if self.daily_state.realized_pnl <= -max_daily_loss:
             self.daily_state.blocked = True
+            self._save_state()
             return None  # Daily loss cap hit
 
         # --- Check 2: Maximum open positions ---
@@ -175,6 +217,7 @@ class RiskManager:
         self._reset_daily_if_needed()
         self.daily_state.realized_pnl += pnl
         self.daily_state.trades_today += 1
+        self._save_state()
         self.trade_log.append({
             "ticker": ticker,
             "pnl": pnl,
@@ -185,6 +228,7 @@ class RiskManager:
     def update_positions(self, count: int):
         """Update open position count."""
         self.daily_state.open_positions = count
+        self._save_state()
 
     def get_status(self) -> dict:
         """Get current risk status summary."""

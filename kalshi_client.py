@@ -147,6 +147,7 @@ class KalshiClient:
         yes_price: int = None,  # price in cents (1-99)
         no_price: int = None,
         expiration_ts: int = None,
+        post_only: bool = True,  # maker orders only (near-zero fees)
     ) -> dict:
         """
         Place an order on a market.
@@ -161,6 +162,8 @@ class KalshiClient:
             "count": count,
             "type": type,
         }
+        if post_only:
+            order["post_only"] = True
         if yes_price is not None:
             order["yes_price"] = yes_price
         if no_price is not None:

@@ -11,6 +11,9 @@ from rich.table import Table
 
 from kalshi_client import KalshiClient
 from market_scanner import MarketScanner
+from config import KALSHI_FEE_PER_SIDE_CENTS
+
+KALSHI_FEE_CENTS_PER_SIDE = KALSHI_FEE_PER_SIDE_CENTS  # alias for existing references
 
 console = Console()
 
@@ -57,12 +60,13 @@ class ArbScanner:
 
             total = yes_p + no_p
             # If total < 100, you can buy both sides for less than $1 and guarantee $1 payout
-            if total < 97:  # 3-cent threshold to account for spread
-                edge = 100 - total
+            fee_adjusted_threshold = 100 - (KALSHI_FEE_CENTS_PER_SIDE * 2)  # ~93 cents
+            if total < fee_adjusted_threshold:
+                edge = fee_adjusted_threshold - total  # net edge after fees
                 opps.append(ArbOpportunity(
                     type="yes_no_arb",
                     ticker=row["ticker"],
-                    description=f"Yes({yes_p}c) + No({no_p}c) = {total}c < 100c → {edge}c edge",
+                    description=f"Yes({yes_p}c) + No({no_p}c) = {total}c < {fee_adjusted_threshold}c → {edge}c edge after fees",
                     edge_cents=edge,
                     confidence=0.9,
                     details={"yes_price": yes_p, "no_price": no_p, "total": total},

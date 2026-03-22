@@ -15,26 +15,26 @@ AutoResearch will evolve it automatically overnight.
 
 # Forecast uncertainty: standard deviation in degrees F for NWS forecasts
 # Keyed by days_out. Lower = more aggressive (tighter model), higher = more conservative.
-FORECAST_STDEV_0 = 1.5  # Same day
-FORECAST_STDEV_1 = 1.8  # Tomorrow
+FORECAST_STDEV_0 = 1.5   # Same day
+FORECAST_STDEV_1 = 2.5   # Tomorrow
 FORECAST_STDEV_2 = 3.5   # Day after tomorrow
 FORECAST_STDEV_3 = 4.5   # 3 days out
 
 # Edge threshold: minimum edge in cents before we place a trade.
 # Too low = many low-quality trades with slippage. Too high = miss good edges.
-EDGE_THRESHOLD_CENTS = 5.0
+EDGE_THRESHOLD_CENTS = 3.0
 
 # Position sizing: number of contracts per trade
-CONTRACTS_PER_TRADE = 25
+CONTRACTS_PER_TRADE = 10
 
 # NWS blend ratio: weight given to NWS official forecast vs. ensemble mean.
 # 0.0 = pure ensemble, 1.0 = pure NWS official. Currently 40% NWS, 60% ensemble.
-NWS_OFFICIAL_WEIGHT = 0.3
+NWS_OFFICIAL_WEIGHT = 0.40
 
 # City weights: relative weight for position sizing per city.
 # Higher weight = trade more contracts in that city.
 CITY_WEIGHT_NYC = 1.0
-CITY_WEIGHT_CHI = 1.5
+CITY_WEIGHT_CHI = 0.0   # Disabled 2026-03-22: March 21 forecast off by 9.5°F, need more data
 CITY_WEIGHT_MIA = 1.0
 CITY_WEIGHT_LA = 1.0
 CITY_WEIGHT_DC = 1.0
@@ -50,7 +50,7 @@ HIGH_CONFIDENCE_EDGE = 7.0  # Above this = "high" confidence
 MEDIUM_CONFIDENCE_EDGE = 5.0  # Above this = "medium" confidence
 
 # Maximum position per single market (dollars)
-MAX_POSITION_DOLLARS = 7.0
+MAX_POSITION_DOLLARS = 5.0
 
 # Minimum volume to consider a market (contracts traded)
 MIN_VOLUME = 10
@@ -59,6 +59,23 @@ MIN_VOLUME = 10
 # (tighter ensemble = more confident forecast = bigger bet)
 TIGHT_ENSEMBLE_THRESHOLD = 2.0
 TIGHT_ENSEMBLE_MULTIPLIER = 1.5
+
+# Edge thresholds per strategy (cents). Each strategy has different baseline edge
+# requirements reflecting different model confidence levels.
+CRYPTO_EDGE_THRESHOLD_CENTS = 4.0   # Crypto (BTC/ETH/SOL) bucket pricing
+SPORTS_EDGE_THRESHOLD_CENTS = 5.0   # NBA/sports model-based edges
+ARB_EDGE_THRESHOLD_CENTS = 3.0      # Arbitrage (lower threshold, built-in edge)
+EXIT_EDGE_THRESHOLD_CENTS = 2.0     # Exit existing position when edge drops below
+
+# Blend weights for day-dependent forecast combination (HRRR + GFS + NWS = 1.0)
+BLEND_HRRR_DAY0 = 0.40   # Day 0: HRRR dominant (3km resolution, best short-range)
+BLEND_GFS_DAY0 = 0.30     # Day 0: GFS ensemble
+BLEND_NWS_DAY0 = 0.30     # Day 0: NWS official
+BLEND_HRRR_DAY1 = 0.25    # Day 1: HRRR fading
+BLEND_GFS_DAY1 = 0.40     # Day 1: GFS takes over
+BLEND_NWS_DAY1 = 0.35     # Day 1: NWS still contributes
+BLEND_GFS_DAY2 = 0.60     # Day 2+: No HRRR, GFS dominant
+BLEND_NWS_DAY2 = 0.40     # Day 2+: NWS fills remainder
 
 
 # =============================================================================
@@ -91,49 +108,23 @@ COPY_SPORTS_MULT = 0.5
 
 
 # =============================================================================
-# CRYPTO PARAMETERS -- AutoResearch will modify these
+# TAIL FADE PARAMETERS -- AutoResearch will modify these
 # =============================================================================
 
-# Minimum edge in cents to flag a crypto range market (4¢ = 4 percentage points)
-CRYPTO_MIN_EDGE_CENTS = 4.0
+# Maximum YES price (in cents) to fade -- buy NO when YES is this cheap
+TAIL_FADE_MAX_PRICE = 5
 
-# Position sizing for crypto trades
-CRYPTO_CONTRACTS_PER_TRADE = 5
-CRYPTO_MAX_POSITION_DOLLARS = 5.0
+# Minimum market volume to consider (filter illiquid markets)
+TAIL_FADE_MIN_VOLUME = 0
 
-# Volatility bias: multiplicative adjustment to realized vol before computing fair value.
-# >1.0 = assume more vol than measured (conservative, fewer center-bucket bets).
-# <1.0 = assume less vol than measured (aggressive, more center-bucket bets).
-CRYPTO_VOL_BIAS_BTC = 1.0  # Bitcoin vol adjustment
-CRYPTO_VOL_BIAS_ETH = 1.0  # Ethereum vol adjustment
-CRYPTO_VOL_BIAS_SOL = 1.0  # Solana vol adjustment
+# Category toggles: 1 = enabled, 0 = disabled
+TAIL_FADE_WEATHER_ENABLED = 1
+TAIL_FADE_CRYPTO_ENABLED = 1
+TAIL_FADE_NBA_ENABLED = 1
 
-# Bucket bias corrections:
-# Center bias < 1.0 discounts YES fair value for center buckets (retail overprices center).
-# Tail multiplier > 1.0 boosts YES fair value for tail buckets (retail underprices tails).
-CRYPTO_CENTER_BUCKET_BIAS = 0.95   # scale fair_yes for buckets within 1 sigma
-CRYPTO_TAIL_BUCKET_MULTIPLIER = 1.0  # scale fair_yes for buckets beyond 1 sigma
-
-
-# =============================================================================
-# SPORTS PARAMETERS -- AutoResearch will modify these
-# =============================================================================
-
-# Home court advantage in NBA (points added to home team's adjusted differential)
-SPORTS_HOME_COURT_ADVANTAGE = 3.2
-
-# Standard deviation of NBA game margin (calibrates logistic win probability)
-SPORTS_NBA_GAME_STDEV = 11.5
-
-# Weight for recent form (last 10 games) vs season-long stats
-SPORTS_RECENT_FORM_WEIGHT = 0.30
-
-# Minimum edge (percentage points) to flag a sports market
-SPORTS_MIN_EDGE_PCT = 5.0
-
-# Position sizing for sports trades
-SPORTS_CONTRACTS_PER_TRADE = 5
-SPORTS_MAX_POSITION_DOLLARS = 5.0
+# Mid-range fade bounds: buy NO when YES price is in this range (cents)
+TAIL_FADE_MID_LOW = 30
+TAIL_FADE_MID_HIGH = 50
 
 
 def get_forecast_stdev():
@@ -155,6 +146,15 @@ def get_city_weights():
         "LA": CITY_WEIGHT_LA,
         "DC": CITY_WEIGHT_DC,
         "Denver": CITY_WEIGHT_DEN,
+    }
+
+
+def get_blend_weights():
+    """Return day-dependent blend weights dict used by auto_trade.py."""
+    return {
+        0: {"hrrr": BLEND_HRRR_DAY0, "gfs": BLEND_GFS_DAY0, "nws": BLEND_NWS_DAY0},
+        1: {"hrrr": BLEND_HRRR_DAY1, "gfs": BLEND_GFS_DAY1, "nws": BLEND_NWS_DAY1},
+        2: {"hrrr": 0.00, "gfs": BLEND_GFS_DAY2, "nws": BLEND_NWS_DAY2},
     }
 
 
@@ -182,6 +182,20 @@ def get_strategy_params():
         "min_volume": MIN_VOLUME,
         "tight_ensemble_threshold": TIGHT_ENSEMBLE_THRESHOLD,
         "tight_ensemble_multiplier": TIGHT_ENSEMBLE_MULTIPLIER,
+        # Per-strategy edge thresholds
+        "crypto_edge_threshold_cents": CRYPTO_EDGE_THRESHOLD_CENTS,
+        "sports_edge_threshold_cents": SPORTS_EDGE_THRESHOLD_CENTS,
+        "arb_edge_threshold_cents": ARB_EDGE_THRESHOLD_CENTS,
+        "exit_edge_threshold_cents": EXIT_EDGE_THRESHOLD_CENTS,
+        # Blend weights
+        "blend_hrrr_day0": BLEND_HRRR_DAY0,
+        "blend_gfs_day0": BLEND_GFS_DAY0,
+        "blend_nws_day0": BLEND_NWS_DAY0,
+        "blend_hrrr_day1": BLEND_HRRR_DAY1,
+        "blend_gfs_day1": BLEND_GFS_DAY1,
+        "blend_nws_day1": BLEND_NWS_DAY1,
+        "blend_gfs_day2": BLEND_GFS_DAY2,
+        "blend_nws_day2": BLEND_NWS_DAY2,
         # Copy-trade parameters
         "copy_min_confidence": COPY_MIN_CONFIDENCE,
         "copy_delay_seconds": COPY_DELAY_SECONDS,
@@ -192,4 +206,12 @@ def get_strategy_params():
         "copy_crypto_mult": COPY_CRYPTO_MULT,
         "copy_politics_mult": COPY_POLITICS_MULT,
         "copy_sports_mult": COPY_SPORTS_MULT,
+        # Tail fade parameters
+        "tail_fade_max_price": TAIL_FADE_MAX_PRICE,
+        "tail_fade_min_volume": TAIL_FADE_MIN_VOLUME,
+        "tail_fade_weather_enabled": TAIL_FADE_WEATHER_ENABLED,
+        "tail_fade_crypto_enabled": TAIL_FADE_CRYPTO_ENABLED,
+        "tail_fade_nba_enabled": TAIL_FADE_NBA_ENABLED,
+        "tail_fade_mid_low": TAIL_FADE_MID_LOW,
+        "tail_fade_mid_high": TAIL_FADE_MID_HIGH,
     }

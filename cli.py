@@ -154,37 +154,26 @@ def backtest(trades, win_rate, plot, monte_carlo, seed):
 @click.option("--quick", is_flag=True, help="Quick 10-iteration test")
 @click.option("--iterations", default=None, type=int, help="Custom iteration count")
 @click.option("--no-claude", is_flag=True, help="Use random mutations only (no API cost)")
-@click.option(
-    "--strategy",
-    type=click.Choice(["weather", "crypto", "sports", "all"]),
-    default="weather",
-    show_default=True,
-    help="Which strategy to optimize",
-)
-def research(overnight, quick, iterations, no_claude, strategy):
+def research(overnight, quick, iterations, no_claude):
     """Start AutoResearch strategy improvement loop."""
-    from autoresearch.research_loop import (
-        run_research, run_crypto_research, run_sports_research,
-    )
+    from autoresearch.research_loop import run_research
 
     if overnight:
         n = iterations or 50
-        console.print(f"[cyan]Starting overnight AutoResearch ({n} iterations, strategy={strategy})...[/cyan]")
+        console.print(f"[cyan]Starting overnight AutoResearch ({n} iterations)...[/cyan]")
         console.print("[dim]This will run for a while. Leave your Terminal open.[/dim]")
         console.print("[dim]Press Ctrl+C to stop at any time.[/dim]\n")
     elif quick:
         n = iterations or 10
-        console.print(f"[cyan]Quick research run ({n} iterations, strategy={strategy})...[/cyan]\n")
+        console.print(f"[cyan]Quick research run ({n} iterations)...[/cyan]\n")
     else:
         n = iterations or 25
-        console.print(f"[cyan]Research run ({n} iterations, strategy={strategy})...[/cyan]\n")
+        console.print(f"[cyan]Research run ({n} iterations)...[/cyan]\n")
 
-    if strategy in ("weather", "all"):
-        run_research(max_iterations=n, verbose=True)
-    if strategy in ("crypto", "all"):
-        run_crypto_research(max_iterations=n, verbose=True)
-    if strategy in ("sports", "all"):
-        run_sports_research(max_iterations=n, verbose=True)
+    run_research(
+        max_iterations=n,
+        verbose=True,
+    )
 
     # Show updated backtest after research
     console.print("\n[cyan]Running backtest with improved strategy...[/cyan]")
@@ -390,14 +379,6 @@ def daily_summary():
         console.print("[red]Private key not found. Check KALSHI_PRIVATE_KEY_PATH in .env[/red]")
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
-
-
-@cli.command("hourly-update")
-def hourly_update():
-    """Send hourly Telegram status update (balance, positions, P&L, new trades)."""
-    from hourly_update import send_hourly_update
-    send_hourly_update()
-    console.print("[green]Hourly update sent via Telegram.[/green]")
 
 
 @cli.command("auto-trade")

@@ -1,0 +1,19 @@
+[Unit]
+Description=Ippo Data Collector - Snapshot market prices for real backtesting
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ippo
+ExecStart=/opt/ippo/.venv/bin/python -c "from settlement_tracker import SettlementTracker; t=SettlementTracker(); t.check_settlements()"
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=120
+
+MemoryMax=256M
+
+StandardOutput=append:/opt/ippo/output/data_collector.log
+StandardError=append:/opt/ippo/output/data_collector.log
+
+[Install]
+WantedBy=default.target

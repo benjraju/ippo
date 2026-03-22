@@ -47,9 +47,8 @@ for _attempt in range(3):
 # Scan interval
 SCAN_INTERVAL_SECONDS = 30
 
-# Kalshi fee per contract (cents). Taker ~1c, maker ~0c.
-# We assume taker on both sides (worst case).
-KALSHI_FEE_PER_SIDE_CENTS = 1.0
+# Kalshi taker fee per side (cents), imported from config
+from config import KALSHI_FEE_PER_SIDE_CENTS
 
 # Minimum edge AFTER fees to execute (cents)
 MIN_EDGE_AFTER_FEES_CENTS = 0.5
@@ -314,10 +313,37 @@ def execute_arb(
     except Exception as e:
         result["error"] = f"NO order failed (YES already placed!): {e}"
         logger.error(f"  NO order failed for {signal.ticker}: {e}")
-        # WARNING: YES side is already placed. We're now exposed directionally.
-        # In production, you'd want to cancel the YES order here.
+
+        # Cancel the YES order to avoid directional exposure
+        yes_oid = result["yes_order_id"]
+        if yes_oid:
+            try:
+                client.cancel_order(yes_oid)
+                logger.warning(
+                    f"  Cancelled YES order {yes_oid} for {signal.ticker} after NO side failed"
+                )
+                result["error"] += f" | YES order {yes_oid} cancelled"
+            except Exception as cancel_err:
+                logger.critical(
+                    f"  FAILED TO CANCEL YES ORDER {yes_oid} for {signal.ticker}: {cancel_err} "
+                    f"-- MANUAL INTERVENTION REQUIRED"
+                )
+                result["error"] += f" | CANCEL FAILED: {cancel_err}"
+                if alert_bot_error:
+                    alert_bot_error(
+                        "arb_runner",
+                        f"CANCEL FAILED: YES order {yes_oid} on {signal.ticker} is OPEN and EXPOSED. "
+                        f"NO side error: {e} | Cancel error: {cancel_err}",
+                    )
+        else:
+            logger.error(f"  No YES order_id to cancel for {signal.ticker} -- cannot recover")
+
         if alert_bot_error:
-            alert_bot_error("arb_runner", f"HALF-FILLED ARB: {signal.ticker} - {e}")
+            alert_bot_error(
+                "arb_runner",
+                f"HALF-FILLED ARB: {signal.ticker} - NO failed: {e} "
+                f"- YES order {'cancelled' if yes_oid else 'missing id'}",
+            )
 
     return result
 
