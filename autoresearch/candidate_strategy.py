@@ -50,7 +50,7 @@ HIGH_CONFIDENCE_EDGE = 7.0  # Above this = "high" confidence
 MEDIUM_CONFIDENCE_EDGE = 5.0  # Above this = "medium" confidence
 
 # Maximum position per single market (dollars)
-MAX_POSITION_DOLLARS = 5.0
+MAX_POSITION_DOLLARS = 7.0
 
 # Minimum volume to consider a market (contracts traded)
 MIN_VOLUME = 10
