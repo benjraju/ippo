@@ -18,6 +18,7 @@ forecast vs. Kalshi market price strategy. It:
 """
 
 import ast
+import csv
 import os
 import re
 import sys
@@ -77,6 +78,7 @@ REAL_OUTCOMES_FILE = Path(__file__).parent / "real_outcomes.json"
 KALSHI_CACHE_FILE = Path(__file__).parent / "kalshi_cache.json"
 HISTORICAL_SETTLEMENTS_FILE = Path(__file__).parent.parent / "output" / "historical_settlements_with_prices.json"
 BACKTEST_DATASET_FILE = Path(__file__).parent.parent / "output" / "backtest_dataset.json"
+TRADE_HISTORY_FILE = Path(__file__).parent.parent / "output" / "trade_history.csv"
 
 # Legacy weight — no longer used (all scenarios are real historical data now).
 KALSHI_SCENARIO_WEIGHT = 0
@@ -139,6 +141,12 @@ MUTATION_SPACE = {
     "TAIL_FADE_NBA_ENABLED": [0, 1],
     "TAIL_FADE_MID_LOW": [30, 35, 40, 45],
     "TAIL_FADE_MID_HIGH": [50, 55, 60],
+    # NBA underdog parameters
+    "UNDERDOG_MAX_PRICE": [20, 25, 30, 35],
+    "UNDERDOG_MIN_PRICE": [5, 8, 10, 15],
+    "UNDERDOG_MAX_BET_DOLLARS": [1, 2, 3, 5],
+    "UNDERDOG_WINNER_ONLY": [0, 1],
+    "UNDERDOG_MAX_CONTRACTS": [10, 15, 20, 25, 30],
 }
 
 
@@ -1672,6 +1680,217 @@ def run_tail_fade_backtest(
 
 
 # =============================================================================
+# NBA UNDERDOG BACKTEST: Buy YES on cheap NBA underdogs
+# =============================================================================
+
+def load_underdog_params() -> dict:
+    """Import candidate_strategy fresh and return NBA underdog params."""
+    for mod_name in list(sys.modules.keys()):
+        if "candidate_strategy" in mod_name:
+            del sys.modules[mod_name]
+
+    sys.path.insert(0, str(STRATEGY_FILE.parent))
+    try:
+        import candidate_strategy as strat
+        importlib.reload(strat)
+        return {
+            "max_price": getattr(strat, "UNDERDOG_MAX_PRICE", 25),
+            "min_price": getattr(strat, "UNDERDOG_MIN_PRICE", 5),
+            "max_bet_dollars": getattr(strat, "UNDERDOG_MAX_BET_DOLLARS", 2),
+            "winner_only": getattr(strat, "UNDERDOG_WINNER_ONLY", 0),
+            "max_contracts": getattr(strat, "UNDERDOG_MAX_CONTRACTS", 15),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def load_real_underdog_trades() -> list[dict]:
+    """
+    Load real trades from trade_history.csv that match the underdog profile:
+    strategy='sports', side='yes', entry_price between 5 and 35 cents,
+    and settlement_result in ('yes', 'no').
+
+    Returns list of dicts with entry_price_cents, result, ticker.
+    """
+    if not TRADE_HISTORY_FILE.exists():
+        return []
+
+    trades = []
+    try:
+        with open(TRADE_HISTORY_FILE, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                strategy = row.get("strategy", "")
+                side = row.get("side", "")
+                settlement = row.get("settlement_result", "")
+                try:
+                    entry_price = float(row.get("entry_price", "0"))
+                except (ValueError, TypeError):
+                    continue
+
+                if (
+                    strategy == "sports"
+                    and side == "yes"
+                    and 5 <= entry_price <= 35
+                    and settlement in ("yes", "no")
+                ):
+                    trades.append({
+                        "entry_price_cents": entry_price,
+                        "result": settlement,
+                        "ticker": row.get("ticker", ""),
+                    })
+    except (IOError, OSError):
+        return []
+
+    return trades
+
+
+def run_underdog_backtest(
+    seed: int = 42,
+    walk_forward: bool = False,
+    _all_markets_cache: list | None = None,
+) -> dict:
+    """
+    Run an NBA underdog backtest against historical settled NBA markets.
+
+    Strategy: buy YES on cheap NBA markets (price in [min_price, max_price]).
+    If winner_only, only trade markets whose title contains 'Winner'.
+
+    If the market settles YES, we profit (100 - entry_price cents per contract).
+    If the market settles NO, we lose (entry_price cents per contract).
+
+    Real trades from trade_history.csv are included at 2x weight for grounding.
+
+    Walk-forward: shuffle with seed, train on 60%, test on 40%.
+
+    Returns dict with score_simulation() metrics.
+    """
+    ud_params = load_underdog_params()
+    if "error" in ud_params:
+        return {"error": ud_params["error"], "score": -999.0}
+
+    max_price = ud_params["max_price"]
+    min_price = ud_params["min_price"]
+    max_bet_dollars = ud_params["max_bet_dollars"]
+    winner_only = ud_params["winner_only"]
+    max_contracts = ud_params["max_contracts"]
+
+    # Load all markets from historical file
+    if _all_markets_cache is not None:
+        all_markets = _all_markets_cache
+    else:
+        if not HISTORICAL_SETTLEMENTS_FILE.exists():
+            return {"error": "No historical settlements file", "score": -999.0}
+        try:
+            with open(HISTORICAL_SETTLEMENTS_FILE, "r") as f:
+                data = json.load(f)
+            all_markets = data.get("markets", [])
+        except (json.JSONDecodeError, IOError) as e:
+            return {"error": str(e), "score": -999.0}
+
+    # Filter to NBA markets
+    nba_markets = [
+        m for m in all_markets
+        if m.get("series") == "KXNBAGAME"
+    ]
+
+    # Build trade candidates from historical settlements
+    candidates = []
+    for m in nba_markets:
+        prev_yes_ask = m.get("prev_yes_ask")
+        if prev_yes_ask is None:
+            continue
+        try:
+            entry_price_cents = float(prev_yes_ask) * 100.0
+        except (ValueError, TypeError):
+            continue
+
+        result = m.get("result", "")
+        if result not in ("yes", "no"):
+            continue
+
+        if entry_price_cents < min_price or entry_price_cents > max_price:
+            continue
+
+        title = m.get("title", "")
+        if winner_only and "Winner" not in title:
+            continue
+
+        candidates.append({
+            "entry_price_cents": entry_price_cents,
+            "result": result,
+            "ticker": m.get("ticker", ""),
+            "title": title,
+        })
+
+    # Add real trades at 2x weight (append each trade twice)
+    real_trades = load_real_underdog_trades()
+    for rt in real_trades:
+        # Filter real trades by current params too
+        if rt["entry_price_cents"] < min_price or rt["entry_price_cents"] > max_price:
+            continue
+        candidates.append(rt)
+        candidates.append(rt)  # 2x weight
+
+    if not candidates:
+        return {"error": "No NBA underdog candidates", "score": -999.0}
+
+    # Shuffle with seed
+    rng = np.random.default_rng(seed)
+    rng.shuffle(candidates)
+
+    # Generate trade results
+    all_trade_results = []
+    for c in candidates:
+        price_cents = c["entry_price_cents"]
+        contracts = min(max_contracts, int(max_bet_dollars * 100 / price_cents)) if price_cents > 0 else 1
+        if contracts < 1:
+            contracts = 1
+
+        cost = contracts * price_cents / 100.0
+
+        if c["result"] == "yes":
+            # Bought YES and it settled YES: profit
+            pnl = contracts * (100 - price_cents) / 100.0
+        else:
+            # Bought YES and it settled NO: loss
+            pnl = -cost
+
+        all_trade_results.append({
+            "city": "NBA",
+            "ticker": c.get("ticker", ""),
+            "type": "underdog",
+            "side": "buy_yes",
+            "edge_cents": price_cents,
+            "contracts": contracts,
+            "cost": round(cost, 4),
+            "pnl": round(pnl, 4),
+            "won": pnl > 0,
+            "true_temp": 0.0,
+            "forecast_temp": 0.0,
+        })
+
+    if not all_trade_results:
+        return {"error": "No underdog trades generated", "score": -999.0}
+
+    # Walk-forward split: train on 60%, test on 40%
+    if walk_forward:
+        split_idx = int(len(all_trade_results) * 0.60)
+        train_results = all_trade_results[:split_idx]
+        test_results = all_trade_results[split_idx:]
+
+        train_metrics = score_simulation(train_results, initial_balance=100.0)
+        test_metrics = score_simulation(test_results, initial_balance=100.0)
+
+        metrics = score_simulation(all_trade_results, initial_balance=100.0)
+        metrics["train_score"] = train_metrics["score"]
+        metrics["test_score"] = test_metrics["score"]
+        return metrics
+
+    return score_simulation(all_trade_results, initial_balance=100.0)
+
+
+# =============================================================================
 # PARAMETER MUTATION
 # =============================================================================
 
@@ -2057,6 +2276,32 @@ def run_research(
                 f"  Walk-forward: train={tf_baseline['train_score']:.4f} "
                 f"test={tf_baseline['test_score']:.4f}"
             )
+
+    # Baseline: score current underdog strategy
+    console.print("[dim]Running baseline underdog backtest...[/dim]")
+    ud_baseline = run_underdog_backtest(
+        seed=42, walk_forward=walk_forward,
+        _all_markets_cache=tail_fade_markets_cache,
+    )
+    if "error" in ud_baseline:
+        console.print(f"[yellow]Underdog baseline: {ud_baseline.get('error', 'unknown')}[/yellow]")
+        ud_baseline_score = -999.0
+    else:
+        ud_baseline_score = ud_baseline["score"]
+        console.print(f"[green]Underdog baseline score: {ud_baseline['score']:.4f}[/green]")
+        console.print(
+            f"  Sortino: {ud_baseline['sortino']:.3f} | "
+            f"ROI: {ud_baseline['roi_pct']:.2f}% | "
+            f"Win: {ud_baseline['win_rate']:.1f}% | "
+            f"MaxDD: {ud_baseline['max_dd_pct']:.2f}% | "
+            f"Trades: {ud_baseline['total_trades']} | "
+            f"PF: {ud_baseline['profit_factor']:.2f}"
+        )
+        if walk_forward and "train_score" in ud_baseline:
+            console.print(
+                f"  Walk-forward: train={ud_baseline['train_score']:.4f} "
+                f"test={ud_baseline['test_score']:.4f}"
+            )
     console.print()
 
     best_score = baseline["score"]
@@ -2065,6 +2310,9 @@ def run_research(
     best_tf_score = tf_baseline_score
     best_tf_train_score = tf_baseline.get("train_score", tf_baseline_score) if "error" not in tf_baseline else -999.0
     best_tf_test_score = tf_baseline.get("test_score", tf_baseline_score) if "error" not in tf_baseline else -999.0
+    best_ud_score = ud_baseline_score
+    best_ud_train_score = ud_baseline.get("train_score", ud_baseline_score) if "error" not in ud_baseline else -999.0
+    best_ud_test_score = ud_baseline.get("test_score", ud_baseline_score) if "error" not in ud_baseline else -999.0
     improvements = 0
     history = []
 
@@ -2087,26 +2335,48 @@ def run_research(
         # Separate mutation spaces for targeted iteration
         weather_params = set(MUTATION_SPACE.keys()) - {
             k for k in MUTATION_SPACE if k.startswith("TAIL_FADE_")
+        } - {
+            k for k in MUTATION_SPACE if k.startswith("UNDERDOG_")
         }
         tail_fade_params = {
             k for k in MUTATION_SPACE if k.startswith("TAIL_FADE_")
+        }
+        underdog_params = {
+            k for k in MUTATION_SPACE if k.startswith("UNDERDOG_")
         }
 
         for i in range(1, max_iterations + 1):
             source = read_strategy_file()
 
-            # Alternate: odd iterations = weather, even = tail fade
-            is_tail_fade_iter = (i % 2 == 0) and tail_fade_markets_cache is not None
-
-            if is_tail_fade_iter:
+            # Three-way rotation: weather / tail-fade / underdog
+            iter_mod = i % 3
+            if iter_mod == 0:
+                # Weather iteration
+                mode_label = "weather"
+                if llm_available and random.random() < 0.70:
+                    try:
+                        param, new_val, reason = llm_guided_mutation(
+                            source, history, RESULTS_LOG
+                        )
+                    except Exception:
+                        param, new_val, reason = random_mutation(source)
+                else:
+                    param, new_val, reason = random_mutation(source)
+            elif iter_mod == 1 and tail_fade_markets_cache is not None:
+                # Tail fade iteration
                 mode_label = "tail_fade"
-                # Pick from tail fade params only
                 param = random.choice(list(tail_fade_params))
                 new_val = random.choice(MUTATION_SPACE[param])
                 reason = "Random tail fade exploration"
+            elif iter_mod == 2 and tail_fade_markets_cache is not None:
+                # Underdog iteration
+                mode_label = "underdog"
+                param = random.choice(list(underdog_params))
+                new_val = random.choice(MUTATION_SPACE[param])
+                reason = "Random underdog exploration"
             else:
+                # Fallback to weather if caches unavailable
                 mode_label = "weather"
-                # Pick mutation: LLM-guided 70% of the time, random 30%
                 if llm_available and random.random() < 0.70:
                     try:
                         param, new_val, reason = llm_guided_mutation(
@@ -2139,10 +2409,21 @@ def run_research(
             seed_scores = []
             first_metrics = None
 
-            if is_tail_fade_iter:
+            if mode_label == "tail_fade":
                 # Run tail fade backtest
                 for s in seeds:
                     m = run_tail_fade_backtest(
+                        seed=s, walk_forward=walk_forward,
+                        _all_markets_cache=tail_fade_markets_cache,
+                    )
+                    if "error" not in m:
+                        seed_scores.append(m)
+                        if first_metrics is None:
+                            first_metrics = m
+            elif mode_label == "underdog":
+                # Run underdog backtest
+                for s in seeds:
+                    m = run_underdog_backtest(
                         seed=s, walk_forward=walk_forward,
                         _all_markets_cache=tail_fade_markets_cache,
                     )
@@ -2172,8 +2453,10 @@ def run_research(
             new_score = sum(s["score"] for s in seed_scores) / len(seed_scores)
 
             # Decision: keep or revert (compare against mode-specific best)
-            if is_tail_fade_iter:
+            if mode_label == "tail_fade":
                 ref_best = best_tf_score
+            elif mode_label == "underdog":
+                ref_best = best_ud_score
             else:
                 ref_best = best_score
 
@@ -2184,10 +2467,15 @@ def run_research(
                 avg_test = sum(
                     s.get("test_score", s["score"]) for s in seed_scores
                 ) / len(seed_scores)
-                if is_tail_fade_iter:
+                if mode_label == "tail_fade":
                     kept = (
                         avg_train > best_tf_train_score
                         and avg_test > best_tf_test_score
+                    )
+                elif mode_label == "underdog":
+                    kept = (
+                        avg_train > best_ud_train_score
+                        and avg_test > best_ud_test_score
                     )
                 else:
                     kept = (
@@ -2198,13 +2486,22 @@ def run_research(
                 kept = new_score > ref_best
 
             if kept:
-                if is_tail_fade_iter:
+                if mode_label == "tail_fade":
                     best_tf_score = new_score
                     if walk_forward and "train_score" in metrics:
                         best_tf_train_score = sum(
                             s.get("train_score", s["score"]) for s in seed_scores
                         ) / len(seed_scores)
                         best_tf_test_score = sum(
+                            s.get("test_score", s["score"]) for s in seed_scores
+                        ) / len(seed_scores)
+                elif mode_label == "underdog":
+                    best_ud_score = new_score
+                    if walk_forward and "train_score" in metrics:
+                        best_ud_train_score = sum(
+                            s.get("train_score", s["score"]) for s in seed_scores
+                        ) / len(seed_scores)
+                        best_ud_test_score = sum(
                             s.get("test_score", s["score"]) for s in seed_scores
                         ) / len(seed_scores)
                 else:
@@ -2262,6 +2559,7 @@ def run_research(
     console.print(f"  Improvements found: {improvements}")
     console.print(f"  Best weather score: {best_score:.4f} (baseline was {baseline['score']:.4f})")
     console.print(f"  Best tail fade score: {best_tf_score:.4f} (baseline was {tf_baseline_score:.4f})")
+    console.print(f"  Best underdog score: {best_ud_score:.4f} (baseline was {ud_baseline_score:.4f})")
 
     # Final weather backtest
     final = run_weather_backtest(
@@ -2303,6 +2601,26 @@ def run_research(
             console.print(f"  Train Score:   {tf_final['train_score']:.4f}")
             console.print(f"  Test Score:    {tf_final['test_score']:.4f}")
 
+    # Final underdog backtest
+    ud_final = run_underdog_backtest(
+        seed=42, walk_forward=walk_forward,
+        _all_markets_cache=tail_fade_markets_cache,
+    )
+    if "error" in ud_final:
+        console.print(f"[yellow]Final underdog backtest: {ud_final.get('error', 'unknown')}[/yellow]")
+    else:
+        console.print(f"\n[bold]Final Underdog Strategy Performance:[/bold]")
+        console.print(f"  Sortino:       {ud_final['sortino']:.3f}")
+        console.print(f"  ROI:           {ud_final['roi_pct']:.2f}%")
+        console.print(f"  Win Rate:      {ud_final['win_rate']:.1f}%")
+        console.print(f"  Max Drawdown:  {ud_final['max_dd_pct']:.2f}%")
+        console.print(f"  Profit Factor: {ud_final['profit_factor']:.2f}")
+        console.print(f"  Total Trades:  {ud_final['total_trades']}")
+        console.print(f"  Total P&L:     ${ud_final['total_pnl']:.2f}")
+        if walk_forward and "train_score" in ud_final:
+            console.print(f"  Train Score:   {ud_final['train_score']:.4f}")
+            console.print(f"  Test Score:    {ud_final['test_score']:.4f}")
+
     console.print(f"\n  Results log: {RESULTS_LOG}")
 
     # Show current best params
@@ -2325,6 +2643,15 @@ def run_research(
                       f"CRYPTO: {'on' if tf_params['crypto_enabled'] else 'off'} | "
                       f"NBA: {'on' if tf_params['nba_enabled'] else 'off'}")
         console.print(f"  MID_FADE: {tf_params['mid_low']}-{tf_params['mid_high']}c")
+
+    ud_params = load_underdog_params()
+    if "error" not in ud_params:
+        console.print(f"\n[bold]Optimized Underdog Parameters:[/bold]")
+        console.print(f"  MAX_PRICE: {ud_params['max_price']}c")
+        console.print(f"  MIN_PRICE: {ud_params['min_price']}c")
+        console.print(f"  MAX_BET: ${ud_params['max_bet_dollars']}")
+        console.print(f"  WINNER_ONLY: {'on' if ud_params['winner_only'] else 'off'}")
+        console.print(f"  MAX_CONTRACTS: {ud_params['max_contracts']}")
 
     console.print(f"[bold cyan]{'=' * 65}[/bold cyan]\n")
 

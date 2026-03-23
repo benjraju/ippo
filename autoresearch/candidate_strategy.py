@@ -127,6 +127,23 @@ TAIL_FADE_MID_LOW = 30
 TAIL_FADE_MID_HIGH = 50
 
 
+# =============================================================================
+# NBA UNDERDOG PARAMETERS -- AutoResearch will modify these
+# =============================================================================
+
+# Price range for underdog entries (cents). Buy YES when market price is in this range.
+# Based on z=7.04 edge from 56 real trades: underdogs at 10-30c win 46% vs 14% implied.
+UNDERDOG_MAX_PRICE = 30        # Upper bound for entry
+UNDERDOG_MIN_PRICE = 10        # Lower bound (avoid illiquid near-zero markets)
+
+# Position sizing
+UNDERDOG_MAX_BET_DOLLARS = 2   # Maximum dollars per underdog bet
+UNDERDOG_MAX_CONTRACTS = 20    # Maximum contracts per single trade
+
+# Market filter: 1 = Winner markets only (proven), 0 = include props too (unproven)
+UNDERDOG_WINNER_ONLY = 1
+
+
 def get_forecast_stdev():
     """Return the FORECAST_STDEV dict used by weather_strategy.py."""
     return {
@@ -214,4 +231,10 @@ def get_strategy_params():
         "tail_fade_nba_enabled": TAIL_FADE_NBA_ENABLED,
         "tail_fade_mid_low": TAIL_FADE_MID_LOW,
         "tail_fade_mid_high": TAIL_FADE_MID_HIGH,
+        # NBA underdog parameters
+        "underdog_max_price": UNDERDOG_MAX_PRICE,
+        "underdog_min_price": UNDERDOG_MIN_PRICE,
+        "underdog_max_bet_dollars": UNDERDOG_MAX_BET_DOLLARS,
+        "underdog_max_contracts": UNDERDOG_MAX_CONTRACTS,
+        "underdog_winner_only": UNDERDOG_WINNER_ONLY,
     }
