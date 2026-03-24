@@ -132,9 +132,10 @@ TAIL_FADE_MID_HIGH = 50
 # =============================================================================
 
 # Price range for underdog entries (cents). Buy YES when market price is in this range.
-# Based on z=7.04 edge from 56 real trades: underdogs at 10-30c win 46% vs 14% implied.
-UNDERDOG_MAX_PRICE = 20  # Upper bound for entry
-UNDERDOG_MIN_PRICE = 8  # Lower bound (avoid illiquid near-zero markets)
+# Calibration data: 5-10c 0% win (neg edge), 10-15c 9% win (neg edge), 20-25c 35% win (pos edge).
+# Target the 18-30c zone where data shows actual positive edge.
+UNDERDOG_MAX_PRICE = 30  # Upper bound for entry
+UNDERDOG_MIN_PRICE = 18  # Lower bound (skip cheap underdogs with negative edge)
 
 # Position sizing
 UNDERDOG_MAX_BET_DOLLARS = 2  # Maximum dollars per underdog bet

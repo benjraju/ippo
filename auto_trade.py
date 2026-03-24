@@ -126,6 +126,19 @@ DAILY_LOSS_CAP_PCT = 0.08        # 8% of account
 
 
 # ---------------------------------------------------------------------------
+# NBA game dedup helper
+# ---------------------------------------------------------------------------
+
+def get_nba_game_id(ticker: str) -> str:
+    """Extract game ID from NBA ticker. E.g., KXNBAGAME-26MAR25OKCBOS-BOS -> KXNBAGAME-26MAR25OKCBOS"""
+    if "KXNBAGAME" in ticker:
+        parts = ticker.rsplit("-", 1)
+        if len(parts) == 2:
+            return parts[0]
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -640,7 +653,7 @@ def run_arb_session(
     # Only arb on series where we have proven edges or true risk-free arb
     ARB_ALLOWED_SERIES = {
         "KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHDEN", "KXHIGHDC", "KXHIGHLA",
-        "KXNBAGAME",  # game winners only (props excluded)
+        # KXNBAGAME removed -- NBA games handled exclusively by underdog session
         "KXBTC", "KXETH", "KXSOL",
     }
 
@@ -678,6 +691,11 @@ def run_arb_session(
         # Filter: only arb on allowed series
         opp_series = opp.ticker.split("-")[0] if hasattr(opp, "ticker") and "-" in opp.ticker else ""
         if opp_series and opp_series not in ARB_ALLOWED_SERIES:
+            continue
+
+        # Skip NBA game winners -- these should ONLY be traded by the NBA underdog session
+        if hasattr(opp, "ticker") and opp.ticker.startswith("KXNBAGAME"):
+            logger.debug(f"  SKIP ARB {opp.ticker}: NBA games handled by underdog session only")
             continue
 
         # Only trade high-confidence, high-edge opportunities
@@ -1263,10 +1281,32 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             underdogs = find_nba_underdogs(client)
             budget = nba_risk_budget(balance)
             underdog_count = 0
+
+            # Build set of NBA game IDs we already have positions on to avoid both-sides betting
+            nba_game_ids_with_positions = set()
+            try:
+                positions = client.get_positions()
+                for mp in positions.get("market_positions", []):
+                    t = mp.get("ticker", "")
+                    pos = float(mp.get("position", mp.get("position_fp", 0)))
+                    if pos != 0:
+                        gid = get_nba_game_id(t)
+                        if gid:
+                            nba_game_ids_with_positions.add(gid)
+                if nba_game_ids_with_positions:
+                    logger.info(f"NBA dedup: already have positions on {len(nba_game_ids_with_positions)} games: {nba_game_ids_with_positions}")
+            except Exception as e:
+                logger.warning(f"NBA dedup: could not fetch positions: {e}")
+
             for ud in underdogs:
                 if underdog_count >= budget.get("max_daily_bets", 5):
                     logger.info(f"NBA underdog daily cap reached ({underdog_count})")
                     break
+                # Skip if we already have a position on this game (avoid both-sides betting)
+                game_id = get_nba_game_id(ud["ticker"])
+                if game_id and game_id in nba_game_ids_with_positions:
+                    logger.info(f"NBA dedup: SKIP {ud['ticker']} -- already have position on game {game_id}")
+                    continue
                 price_cents = int(ud.get("yes_price_cents", 20))
                 cost_per = price_cents / 100.0
                 max_contracts = int(budget.get("max_bet_dollars", 2.0) / cost_per) if cost_per > 0 else 0
