@@ -1,0 +1,18 @@
+[Unit]
+Description=Ippo AutoResearch Agent (Karpathy-style)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ippo
+ExecStart=/bin/bash autoresearch/run_experiments.sh
+Restart=on-failure
+RestartSec=60
+StandardOutput=append:/opt/ippo/output/autoresearch_agent.log
+StandardError=append:/opt/ippo/output/autoresearch_agent.log
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target

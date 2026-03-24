@@ -102,6 +102,28 @@ except (ImportError, OSError):
         "SOL": {"kalshi_series": "KXSOL", "coinbase_pair": "SOL-USD", "coingecko_id": "solana", "default_annual_vol": 0.85},
     }
 
+try:
+    from brier_tracker import BrierTracker
+    _brier = BrierTracker()
+except ImportError:
+    _brier = None
+
+try:
+    from weather_tail_strategy import find_weather_tail_trades, tail_risk_budget
+except ImportError:
+    find_weather_tail_trades = None
+
+try:
+    from momentum_strategy import detect_momentum_signals, generate_momentum_trades
+except ImportError:
+    detect_momentum_signals = None
+    generate_momentum_trades = None
+
+try:
+    from nba_underdog_strategy import find_nba_underdogs, nba_risk_budget
+except (ImportError, OSError):
+    find_nba_underdogs = None
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1697,6 +1719,14 @@ def run_arb_session(
     strategy = load_strategy_params()
     arb_edge_threshold = strategy["arb_edge_threshold"]
 
+    # Only arb on series where we have proven edges or true risk-free arb
+    # Exclude KXNBAPTS (no player-level edge) and other unproven series
+    ARB_ALLOWED_SERIES = {
+        "KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHDEN", "KXHIGHDC", "KXHIGHLA",
+        "KXNBAGAME",  # game winners only (props excluded)
+        "KXBTC", "KXETH", "KXSOL",
+    }
+
     if ArbScanner is None:
         logger.warning("arb_scanner not available, skipping arb session")
         logger.info("--- ARB SESSION DONE: 0 decisions, 0 trades ---")
@@ -1727,6 +1757,11 @@ def run_arb_session(
         if trades_placed >= MAX_ARB_TRADES_PER_DAY:
             logger.info(f"Arb trade cap reached ({MAX_ARB_TRADES_PER_DAY})")
             break
+
+        # Filter: only arb on allowed series (no KXNBAPTS props, no unproven markets)
+        opp_series = opp.ticker.split("-")[0] if hasattr(opp, "ticker") and "-" in opp.ticker else ""
+        if opp_series and opp_series not in ARB_ALLOWED_SERIES:
+            continue
 
         # Only trade high-confidence, high-edge opportunities (evolved from candidate_strategy)
         if opp.edge_cents < arb_edge_threshold:
@@ -2447,6 +2482,21 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             alert_bot_error("auto_trade", str(e))
         return
 
+    # Clean up stale resting orders from previous sessions
+    try:
+        stale_orders = client._request("GET", "/portfolio/orders", params={"status": "resting", "limit": 200})
+        stale = [o for o in stale_orders.get("orders", []) if o.get("remaining_count", 0) == 0]
+        if stale:
+            for o in stale:
+                try:
+                    client._request("DELETE", f"/portfolio/orders/{o['order_id']}")
+                except Exception:
+                    pass
+                time.sleep(0.1)
+            logger.info(f"Cleaned up {len(stale)} stale resting orders")
+    except Exception as e:
+        logger.warning(f"Stale order cleanup failed: {e}")
+
     # Check account balance
     balance = get_account_balance(client, logger)
     if balance is None:
@@ -2478,7 +2528,10 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             alert_bot_error("auto_trade", str(e))
 
     # --- Weather session ---
-    if weather:
+    # DISABLED 2026-03-23: Mid-range weather has NEGATIVE Kelly (-8.6%).
+    # Market is 96.4% calibrated at 40-60c. No edge exists here.
+    # Weather tails (buy NO on cheap YES) run separately below.
+    if False and weather:
         try:
             weather_decisions = run_weather_session(client, balance, dry_run, logger)
             all_decisions.extend(weather_decisions)
@@ -2487,9 +2540,12 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             logger.error(traceback.format_exc())
             if alert_bot_error:
                 alert_bot_error("auto_trade", str(e))
+    else:
+        logger.info("--- WEATHER SESSION SKIPPED (no proven mid-range edge) ---")
 
     # --- Crypto session (BTC + ETH + SOL) ---
-    if btc:
+    # DISABLED 2026-03-23: Only 3-5 days of crypto data. Cannot validate edge.
+    if False and btc:
         try:
             crypto_decisions = run_crypto_session(client, balance, dry_run, logger)
             all_decisions.extend(crypto_decisions)
@@ -2498,15 +2554,95 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             logger.error(traceback.format_exc())
             if alert_bot_error:
                 alert_bot_error("auto_trade", str(e))
+    else:
+        logger.info("--- CRYPTO SESSION SKIPPED (insufficient data, no proven edge) ---")
 
     # --- Sports session ---
-    if sports:
+    # DISABLED 2026-03-23: Sports session places NBA props (no player-level data,
+    # -$17 P&L) and non-underdog bets (no proven edge). NBA underdog YES bets
+    # are the only proven sports edge — handled by arb + manual for now.
+    # TODO: Create a focused underdog-only session once we have n>200 settled.
+    if False and sports:
         try:
             sports_decisions = run_sports_session(client, balance, dry_run, logger)
             all_decisions.extend(sports_decisions)
         except Exception as e:
             logger.error(f"Sports session crashed: {e}")
             logger.error(traceback.format_exc())
+    else:
+        logger.info("--- SPORTS SESSION SKIPPED (props have no edge, underdog-only session needed) ---")
+
+    # --- NBA Underdog session (focused, proven edge) ---
+    # Buys YES on KXNBAGAME underdogs priced 10-30c.
+    # Historical: 29.7% win rate vs 22% implied = +7.7pp edge, ROI +33%, Sharpe 2.64.
+    # Conservative sizing: quarter Kelly, max $2/trade, max 5 bets/day.
+    if find_nba_underdogs is not None:
+        try:
+            underdogs = find_nba_underdogs(client)
+            budget = nba_risk_budget(balance)
+            underdog_count = 0
+            for ud in underdogs:
+                if underdog_count >= budget.get("max_daily_bets", 5):
+                    logger.info(f"NBA underdog daily cap reached ({underdog_count})")
+                    break
+                price_cents = int(ud.get("yes_price_cents", 20))
+                cost_per = price_cents / 100.0
+                max_contracts = int(budget.get("max_bet_dollars", 2.0) / cost_per) if cost_per > 0 else 0
+                contracts = max(1, min(ud.get("suggested_contracts", 1), max_contracts))
+                if contracts <= 0:
+                    continue
+                decision = TradeDecision(
+                    ticker=ud["ticker"],
+                    action="buy_yes",
+                    strategy="nba_underdog",
+                    edge_cents=ud.get("edge_pp", 0) * 1.0,
+                    fair_value_cents=ud.get("estimated_prob", 0.297) * 100,
+                    market_price_cents=price_cents,
+                    price_to_pay_cents=price_cents,
+                    contracts=contracts,
+                    max_loss_dollars=contracts * cost_per,
+                    reason=(
+                        f"NBA underdog: YES@{price_cents}c, "
+                        f"impl={ud.get('implied_prob',0)*100:.0f}%, "
+                        f"est={ud.get('estimated_prob',0)*100:.1f}%, "
+                        f"edge={ud.get('edge_pp',0):+.1f}pp, "
+                        f"EV={ud.get('ev_per_contract',0)*100:.1f}c"
+                    ),
+                    placed=False,
+                )
+                if not dry_run:
+                    try:
+                        result = client.place_order(
+                            ticker=decision.ticker,
+                            side="yes",
+                            action="buy",
+                            count=contracts,
+                            type="limit",
+                            yes_price=price_cents,
+                        )
+                        decision.placed = True
+                        decision.order_id = result.get("order", {}).get("order_id", "")
+                        logger.info(
+                            f"NBA UNDERDOG: {decision.ticker} BUY YES x{contracts} "
+                            f"@{price_cents}c edge={ud.get('edge_pp',0):+.1f}pp"
+                        )
+                    except Exception as e:
+                        decision.error = str(e)
+                        logger.warning(f"NBA underdog order failed: {e}")
+                else:
+                    logger.info(
+                        f"[DRY] NBA UNDERDOG: {decision.ticker} YES x{contracts} "
+                        f"@{price_cents}c edge={ud.get('edge_pp',0):+.1f}pp"
+                    )
+                all_decisions.append(decision)
+                underdog_count += 1
+        except Exception as e:
+            logger.error(f"NBA underdog session crashed: {e}")
+            logger.error(traceback.format_exc())
+            if alert_bot_error:
+                alert_bot_error("auto_trade", str(e))
+    else:
+        logger.info("--- NBA UNDERDOG SESSION SKIPPED (module not found) ---")
 
     # --- Arb session ---
     if arb:
@@ -2519,15 +2655,21 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             if alert_bot_error:
                 alert_bot_error("auto_trade", str(e))
 
-    # --- Tail Fade session (runs every cycle) ---
-    try:
-        tail_fade_decisions = run_tail_fade_session(client, balance, dry_run, logger)
-        all_decisions.extend(tail_fade_decisions)
-    except Exception as e:
-        logger.error(f"Tail fade session crashed: {e}")
-        logger.error(traceback.format_exc())
-        if alert_bot_error:
-            alert_bot_error("auto_trade", str(e))
+    # --- Tail Fade session ---
+    # DISABLED 2026-03-23: Replaced by weather_tail_strategy which uses
+    # NWS forecast + dutch book math for validated edge calculation.
+    # Old tail fade traded mid-range (30-50c) which has no proven edge.
+    if False:
+        try:
+            tail_fade_decisions = run_tail_fade_session(client, balance, dry_run, logger)
+            all_decisions.extend(tail_fade_decisions)
+        except Exception as e:
+            logger.error(f"Tail fade session crashed: {e}")
+            logger.error(traceback.format_exc())
+            if alert_bot_error:
+                alert_bot_error("auto_trade", str(e))
+    else:
+        logger.info("--- TAIL FADE SESSION SKIPPED (replaced by weather_tail_strategy) ---")
 
     # --- Dutch Book session (runs every cycle) ---
     try:
@@ -2539,8 +2681,194 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         if alert_bot_error:
             alert_bot_error("auto_trade", str(e))
 
+    # --- Weather Tail session (buy NO on cheap YES weather markets) ---
+    if find_weather_tail_trades is not None:
+        try:
+            tail_trades = find_weather_tail_trades(client)
+            risk = tail_risk_budget(balance)
+            for tt in tail_trades[:5]:  # max 5 tail trades per cycle
+                contracts = min(tt.get("suggested_contracts", 1), risk.get("max_contracts", 5))
+                if contracts <= 0:
+                    continue
+                price_cents = int(tt.get("no_price_cents", 97))
+                decision = TradeDecision(
+                    ticker=tt["ticker"],
+                    action="buy_no",
+                    strategy="weather_tail",
+                    edge_cents=tt.get("net_edge_cents", 0),
+                    fair_value_cents=tt.get("our_no_prob", 0.99) * 100,
+                    market_price_cents=tt.get("yes_price_cents", 3),
+                    price_to_pay_cents=price_cents,
+                    contracts=contracts,
+                    max_loss_dollars=contracts * price_cents / 100.0,
+                    reason=f"Weather tail: YES@{tt.get('yes_price_cents',0)}c, P(NO)={tt.get('our_no_prob',0.99):.3f}, edge={tt.get('net_edge_cents',0):.1f}c",
+                    placed=False,
+                )
+                if not dry_run:
+                    try:
+                        result = client.place_order(
+                            ticker=decision.ticker,
+                            side="no",
+                            action="buy",
+                            count=contracts,
+                            type="limit",
+                            no_price=price_cents,
+                        )
+                        decision.placed = True
+                        decision.order_id = result.get("order", {}).get("order_id", "")
+                        logger.info(f"WEATHER TAIL: {decision.ticker} BUY NO x{contracts} @{price_cents}c edge={decision.edge_cents:.1f}c")
+                    except Exception as e:
+                        decision.error = str(e)
+                        logger.warning(f"Weather tail order failed: {e}")
+                else:
+                    logger.info(f"[DRY] WEATHER TAIL: {decision.ticker} NO x{contracts} @{price_cents}c")
+                all_decisions.append(decision)
+        except Exception as e:
+            logger.error(f"Weather tail session crashed: {e}")
+            logger.error(traceback.format_exc())
+
+    # --- Momentum session (DRY-RUN data collection only) ---
+    # DEPLOYED 2026-03-23: Logs momentum signals from price_snapshots.jsonl.
+    # ALWAYS runs in data-collection mode (never places live trades) until
+    # we have 7+ days of 60-second NBA snapshot data to validate the strategy.
+    # See momentum_strategy.py for details on why backtest is inconclusive.
+    if detect_momentum_signals is not None:
+        try:
+            signals = detect_momentum_signals()
+            if signals:
+                logger.info(f"--- MOMENTUM SESSION (DRY-RUN ONLY) ---")
+                momentum_decisions = generate_momentum_trades(
+                    client=client,
+                    signals=signals,
+                    bankroll=balance,
+                    dry_run=True,  # ALWAYS dry-run until data validates strategy
+                )
+                for md in momentum_decisions:
+                    logger.info(
+                        f"  [MOMENTUM SIGNAL] {md['action']:8s} {md['ticker']:35s} "
+                        f"delta={md['signal']['delta_cents']:+.0f}c "
+                        f"({md['signal']['prev_price']:.2f}->{md['signal']['curr_price']:.2f})"
+                    )
+                    decision = TradeDecision(
+                        ticker=md["ticker"],
+                        action=md["action"],
+                        strategy="momentum",
+                        edge_cents=md["edge_cents"],
+                        fair_value_cents=md["fair_value_cents"],
+                        market_price_cents=md["market_price_cents"],
+                        price_to_pay_cents=md["price_to_pay_cents"],
+                        contracts=0,  # 0 contracts = signal logged but not traded
+                        max_loss_dollars=0,
+                        reason=md["reason"],
+                        placed=False,
+                    )
+                    all_decisions.append(decision)
+                logger.info(f"--- MOMENTUM SESSION DONE: {len(momentum_decisions)} signals logged (not traded) ---")
+            else:
+                logger.info("--- MOMENTUM SESSION: no signals detected ---")
+        except Exception as e:
+            logger.error(f"Momentum session crashed: {e}")
+            logger.error(traceback.format_exc())
+    else:
+        logger.info("--- MOMENTUM SESSION SKIPPED (module not available) ---")
+
+    # --- Deep ITM Maker session (buy YES at 95c on near-certain markets) ---
+    try:
+        from deep_itm_strategy import find_deep_itm_opportunities, deep_itm_risk_budget
+        logger.info("--- DEEP ITM MAKER SESSION START ---")
+        itm_opps = find_deep_itm_opportunities(client)
+        itm_budget = deep_itm_risk_budget(balance)
+        itm_count = 0
+        max_itm = itm_budget.get("max_positions", 10)
+        for opp in itm_opps[:max_itm]:
+            if itm_count >= max_itm:
+                break
+            contracts = min(opp.get("suggested_contracts", 1), itm_budget.get("max_contracts_per_position", 3))
+            if contracts <= 0:
+                continue
+            bid_price = opp.get("our_bid_cents", 95)
+            decision = TradeDecision(
+                ticker=opp["ticker"],
+                action="buy_yes",
+                strategy="deep_itm",
+                edge_cents=opp.get("ev_cents", 0),
+                fair_value_cents=opp.get("win_rate", 0.996) * 100,
+                market_price_cents=opp.get("current_yes_ask_cents", 99),
+                price_to_pay_cents=bid_price,
+                contracts=contracts,
+                max_loss_dollars=contracts * bid_price / 100.0,
+                reason=f"Deep ITM: YES@{opp.get('current_yes_ask_cents',99)}c, bid@{bid_price}c, WR={opp.get('win_rate',0.996):.3f}, EV={opp.get('ev_cents',0):.1f}c",
+                placed=False,
+            )
+            if not dry_run:
+                try:
+                    result = client.place_order(
+                        ticker=decision.ticker,
+                        side="yes",
+                        action="buy",
+                        count=contracts,
+                        type="limit",
+                        yes_price=bid_price,
+                        post_only=True,
+                    )
+                    decision.placed = True
+                    decision.order_id = result.get("order", {}).get("order_id", "")
+                    logger.info(
+                        f"DEEP ITM: {decision.ticker} BUY YES x{contracts} "
+                        f"@{bid_price}c EV={opp.get('ev_cents',0):.1f}c"
+                    )
+                except Exception as e:
+                    decision.error = str(e)
+                    logger.warning(f"Deep ITM order failed: {e}")
+            else:
+                logger.info(
+                    f"[DRY] DEEP ITM: {decision.ticker} YES x{contracts} @{bid_price}c"
+                )
+            all_decisions.append(decision)
+            itm_count += 1
+        logger.info(f"--- DEEP ITM SESSION DONE: {itm_count} orders ---")
+    except ImportError:
+        logger.info("--- DEEP ITM SESSION SKIPPED (module not found) ---")
+    except Exception as e:
+        logger.error(f"Deep ITM session crashed: {e}")
+        logger.error(traceback.format_exc())
+
+    # --- Discovery Trader session ---
+    # DISABLED 2026-03-24: Discovery trader places random bets on unproven markets
+    # (parlays, props, esports, Trump mentions). -$173 P&L with 33% win rate.
+    # No model, no edge — pure speculation. Will be replaced by Karpathy-style
+    # autoresearch that discovers and validates strategies before trading them.
+    if False:
+        try:
+            from discovery_trader import execute_discovery_session
+            discovery_decisions = execute_discovery_session(client, balance, dry_run, logger)
+            for dd in discovery_decisions:
+                all_decisions.append(TradeDecision(
+                    ticker=dd["ticker"],
+                    action=dd["action"],
+                    strategy=dd["strategy"],
+                    edge_cents=dd.get("edge_cents", 0),
+                    fair_value_cents=dd.get("fair_value_cents", 50),
+                    market_price_cents=dd.get("market_price_cents", 50),
+                    price_to_pay_cents=dd.get("price_to_pay_cents", 50),
+                    contracts=dd.get("contracts", 0),
+                    max_loss_dollars=dd.get("max_loss_dollars", 0),
+                    reason=dd.get("reason", ""),
+                    placed=dd.get("placed", False),
+                    order_id=dd.get("order_id", ""),
+                    error=dd.get("error", ""),
+                ))
+        except ImportError:
+            pass
+        except Exception:
+            pass
+    else:
+        logger.info("--- DISCOVERY TRADER SESSION DISABLED (no proven edge, -$173 P&L) ---")
+
     # --- Copy-trade session ---
-    if copy:
+    # DISABLED 2026-03-23: Copy-trade has only been simulated, never validated
+    # with live data. Re-enable once we have real copy-trade P&L data.
+    if False and copy:
         try:
             from copy_trade import get_copy_signals
             copy_signals = get_copy_signals(client)
@@ -2693,6 +3021,24 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         strategy_str = ", ".join(f"{k}:{v}" for k, v in sorted(strategy_counts.items()))
         logger.info(f"Strategy breakdown: {strategy_str}")
         alert_daily_summary(len(trades_placed), total_deployed, 0)
+
+    # Record estimates for Brier calibration
+    if _brier is not None:
+        for d in all_decisions:
+            if d.contracts > 0 and d.fair_value_cents > 0:
+                try:
+                    our_prob = d.fair_value_cents / 100.0
+                    market_prob = d.market_price_cents / 100.0
+                    _brier.record_estimate(
+                        ticker=d.ticker,
+                        market_title=d.reason[:80] if d.reason else d.ticker,
+                        series=d.ticker.split("-")[0] if "-" in d.ticker else d.strategy,
+                        our_probability=our_prob,
+                        market_price=market_prob,
+                        strategy=d.strategy,
+                    )
+                except Exception:
+                    pass
 
     logger.info("=" * 60)
     logger.info("AUTO-TRADE SESSION COMPLETE")

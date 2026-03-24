@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 .venv/
+.claude/
 output/
 autoresearch/results.log
 autoresearch/launchd.log

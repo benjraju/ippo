@@ -112,18 +112,18 @@ COPY_SPORTS_MULT = 0.5
 # =============================================================================
 
 # Maximum YES price (in cents) to fade -- buy NO when YES is this cheap
-TAIL_FADE_MAX_PRICE = 5
+TAIL_FADE_MAX_PRICE = 20
 
 # Minimum market volume to consider (filter illiquid markets)
-TAIL_FADE_MIN_VOLUME = 0
+TAIL_FADE_MIN_VOLUME = 100
 
 # Category toggles: 1 = enabled, 0 = disabled
-TAIL_FADE_WEATHER_ENABLED = 1
+TAIL_FADE_WEATHER_ENABLED = 0
 TAIL_FADE_CRYPTO_ENABLED = 1
-TAIL_FADE_NBA_ENABLED = 1
+TAIL_FADE_NBA_ENABLED = 0
 
 # Mid-range fade bounds: buy NO when YES price is in this range (cents)
-TAIL_FADE_MID_LOW = 30
+TAIL_FADE_MID_LOW = 45
 TAIL_FADE_MID_HIGH = 50
 
 
@@ -133,15 +133,49 @@ TAIL_FADE_MID_HIGH = 50
 
 # Price range for underdog entries (cents). Buy YES when market price is in this range.
 # Based on z=7.04 edge from 56 real trades: underdogs at 10-30c win 46% vs 14% implied.
-UNDERDOG_MAX_PRICE = 30        # Upper bound for entry
-UNDERDOG_MIN_PRICE = 10        # Lower bound (avoid illiquid near-zero markets)
+UNDERDOG_MAX_PRICE = 20  # Upper bound for entry
+UNDERDOG_MIN_PRICE = 8  # Lower bound (avoid illiquid near-zero markets)
 
 # Position sizing
-UNDERDOG_MAX_BET_DOLLARS = 2   # Maximum dollars per underdog bet
-UNDERDOG_MAX_CONTRACTS = 20    # Maximum contracts per single trade
+UNDERDOG_MAX_BET_DOLLARS = 2  # Maximum dollars per underdog bet
+UNDERDOG_MAX_CONTRACTS = 20  # Maximum contracts per single trade
 
 # Market filter: 1 = Winner markets only (proven), 0 = include props too (unproven)
 UNDERDOG_WINNER_ONLY = 1
+
+
+# =============================================================================
+# WEATHER TAIL PARAMETERS -- AutoResearch will modify these
+# =============================================================================
+
+# Maximum YES price in cents to consider for tail fade (buy NO)
+WEATHER_TAIL_MAX_YES = 15
+
+# Minimum model P(NO) required to place a tail trade
+WEATHER_TAIL_MIN_NO_PROB = 0.90
+
+# Minimum edge in cents after fees to place a tail trade
+WEATHER_TAIL_MIN_EDGE = 0.5
+
+# Maximum contracts per tail trade
+WEATHER_TAIL_MAX_CONTRACTS = 3
+
+
+# =============================================================================
+# DEEP ITM PARAMETERS -- AutoResearch will modify these
+# =============================================================================
+
+# Bid price in cents for deep ITM YES orders (maker limit)
+DEEP_ITM_BID_PRICE = 95
+
+# Maximum simultaneous deep ITM positions
+DEEP_ITM_MAX_POSITIONS = 10
+
+# Maximum % of bankroll per single deep ITM position
+DEEP_ITM_MAX_POSITION_PCT = 0.05
+
+# Minimum bid-ask spread to place a deep ITM order
+DEEP_ITM_MIN_SPREAD = 2
 
 
 def get_forecast_stdev():
@@ -237,4 +271,62 @@ def get_strategy_params():
         "underdog_max_bet_dollars": UNDERDOG_MAX_BET_DOLLARS,
         "underdog_max_contracts": UNDERDOG_MAX_CONTRACTS,
         "underdog_winner_only": UNDERDOG_WINNER_ONLY,
+        # Weather tail parameters
+        "weather_tail_max_yes": WEATHER_TAIL_MAX_YES,
+        "weather_tail_min_no_prob": WEATHER_TAIL_MIN_NO_PROB,
+        "weather_tail_min_edge": WEATHER_TAIL_MIN_EDGE,
+        "weather_tail_max_contracts": WEATHER_TAIL_MAX_CONTRACTS,
+        # Deep ITM parameters
+        "deep_itm_bid_price": DEEP_ITM_BID_PRICE,
+        "deep_itm_max_positions": DEEP_ITM_MAX_POSITIONS,
+        "deep_itm_max_position_pct": DEEP_ITM_MAX_POSITION_PCT,
+        "deep_itm_min_spread": DEEP_ITM_MIN_SPREAD,
     }
+
+
+# =============================================================================
+# STRATEGY LOGIC — AutoResearch agent modifies this function
+# =============================================================================
+# The backtest harness calls evaluate_market() for each historical market.
+# Return {"action": "buy_yes"|"buy_no", "contracts": N} to trade,
+# or None / {"action": "skip"} to pass.
+
+def evaluate_market(ticker, series, yes_cents, ask_cents, bid_cents, volume, settled_yes=None):
+    """
+    Core strategy decision function. Called by backtest_harness.py for each market.
+
+    AutoResearch agent: modify this function to implement new strategies.
+    The parameters above are still used by auto_trade.py for live trading.
+
+    Args:
+        ticker: Market ticker (e.g., "KXHIGHNY-26MAR21-T60")
+        series: Series prefix (e.g., "KXHIGHNY")
+        yes_cents: Last YES price in cents (0-100)
+        ask_cents: YES ask price in cents
+        bid_cents: YES bid price in cents
+        volume: Total volume traded
+        settled_yes: True if settled YES, False if NO (None during live trading)
+
+    Returns:
+        dict with "action" and "contracts", or None to skip.
+    """
+    # --- Weather tail NO: buy NO on cheap YES weather markets ---
+    if series.startswith("KXHIGH"):
+        if 0 < yes_cents <= WEATHER_TAIL_MAX_YES and volume >= 10:
+            return {"action": "buy_no", "contracts": WEATHER_TAIL_MAX_CONTRACTS}
+
+    # --- Crypto tail NO: same logic for BTC/ETH ---
+    if series.startswith(("KXBTC", "KXETH", "KXSOL")):
+        if 0 < yes_cents <= WEATHER_TAIL_MAX_YES and volume >= 10:
+            return {"action": "buy_no", "contracts": 1}
+
+    # --- NBA underdog YES: buy YES on cheap game winners ---
+    if series.startswith("KXNBAGAME"):
+        # Skip props, totals, spreads — only game winner markets
+        t_upper = ticker.upper()
+        if any(kw in t_upper for kw in ["PTS", "TOTAL", "SPREAD", "MENTION"]):
+            return None
+        if UNDERDOG_MIN_PRICE <= yes_cents <= UNDERDOG_MAX_PRICE and volume >= 50:
+            return {"action": "buy_yes", "contracts": min(UNDERDOG_MAX_CONTRACTS, 5)}
+
+    return None
