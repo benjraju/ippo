@@ -1,0 +1,19 @@
+[Unit]
+Description=Ippo Weather Tail Scanner - Fast 30-min weather tail NO scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ippo
+ExecStart=/opt/ippo/.venv/bin/python /opt/ippo/weather_tail_runner.py --live --no-confirm
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=120
+
+MemoryMax=512M
+
+StandardOutput=append:/opt/ippo/output/weather_tail_runner.log
+StandardError=append:/opt/ippo/output/weather_tail_runner.log
+
+[Install]
+WantedBy=default.target

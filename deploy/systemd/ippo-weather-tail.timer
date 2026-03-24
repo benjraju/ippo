@@ -1,0 +1,10 @@
+[Unit]
+Description=Ippo Weather Tail Timer - Scan every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00,30:00
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
