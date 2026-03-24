@@ -76,8 +76,15 @@ except ImportError:
 
 try:
     from nba_underdog_strategy import find_nba_underdogs, nba_risk_budget
-except (ImportError, OSError):
+except Exception as _nba_import_err:
+    logging.getLogger("auto_trade").error(
+        "NBA underdog strategy import FAILED: %s: %s",
+        type(_nba_import_err).__name__, _nba_import_err,
+    )
+    import traceback as _tb
+    logging.getLogger("auto_trade").debug(_tb.format_exc())
     find_nba_underdogs = None
+    nba_risk_budget = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -650,6 +657,15 @@ def run_arb_session(
     strategy = load_strategy_params()
     arb_edge_threshold = strategy["arb_edge_threshold"]
 
+    # Capital cap: max 20% of account balance deployed in arb trades per cycle
+    ARB_CAPITAL_CAP_PCT = 0.20
+    arb_capital_cap = balance * ARB_CAPITAL_CAP_PCT
+    arb_capital_deployed = 0.0
+    logger.info(f"Arb capital cap: ${arb_capital_cap:.2f} (20% of ${balance:.2f})")
+
+    # Track remaining cash balance to avoid 400 errors from insufficient funds
+    remaining_balance = balance
+
     # Only arb on series where we have proven edges or true risk-free arb
     ARB_ALLOWED_SERIES = {
         "KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHDEN", "KXHIGHDC", "KXHIGHLA",
@@ -688,6 +704,11 @@ def run_arb_session(
             logger.info(f"Arb trade cap reached ({MAX_ARB_TRADES_PER_DAY})")
             break
 
+        # Capital cap check: stop placing arb trades once we've deployed enough
+        if arb_capital_deployed >= arb_capital_cap:
+            logger.info(f"Arb capital cap reached: ${arb_capital_deployed:.2f} >= ${arb_capital_cap:.2f}")
+            break
+
         # Filter: only arb on allowed series
         opp_series = opp.ticker.split("-")[0] if hasattr(opp, "ticker") and "-" in opp.ticker else ""
         if opp_series and opp_series not in ARB_ALLOWED_SERIES:
@@ -712,8 +733,27 @@ def run_arb_session(
             total_cost_cents = yes_price + no_price
             cost_per_pair = total_cost_cents / 100.0  # dollars per pair
 
-            # Size: enough pairs to deploy up to $1, capped by daily loss cap
-            max_dollars = min(1.0, daily_loss_cap)
+            # Fee calculation: Kalshi charges ~1.75% * price * (1-price) per side
+            # For a YES+NO arb we pay fees on BOTH sides
+            MAKER_FEE_RATE = 0.0175
+            yes_fee_cents = MAKER_FEE_RATE * yes_price * (100 - yes_price) / 100.0
+            no_fee_cents = MAKER_FEE_RATE * no_price * (100 - no_price) / 100.0
+            total_fee_cents = yes_fee_cents + no_fee_cents
+            profit_after_fees_cents = (100 - total_cost_cents) - total_fee_cents
+
+            if profit_after_fees_cents <= 1.0:
+                logger.debug(
+                    f"  SKIP ARB {opp.ticker}: profit after fees {profit_after_fees_cents:.2f}c <= 1c "
+                    f"(gross edge {100 - total_cost_cents}c, fees {total_fee_cents:.2f}c)"
+                )
+                continue
+
+            # Size: enough pairs to deploy up to $1, capped by daily loss cap AND arb capital cap
+            remaining_arb_cap = arb_capital_cap - arb_capital_deployed
+            max_dollars = min(1.0, daily_loss_cap, remaining_arb_cap)
+            if max_dollars <= 0:
+                logger.info(f"  SKIP ARB {opp.ticker}: arb capital cap exhausted")
+                break
             pairs = max(1, int(max_dollars / cost_per_pair)) if cost_per_pair > 0 else 0
             actual_cost = pairs * cost_per_pair
 
@@ -748,22 +788,35 @@ def run_arb_session(
             if alert_big_edge and opp.edge_cents > 10:
                 alert_big_edge(opp.ticker, opp.edge_cents, "ARB")
 
-            # Balance check
-            current_balance = get_account_balance(client, logger)
-            if current_balance is not None and actual_cost > current_balance:
+            # Pre-flight balance check (local tracking, no API call)
+            if actual_cost > remaining_balance:
                 decision_yes.reason += " | SKIP: insufficient balance"
                 decision_yes.contracts = 0
                 decision_no.contracts = 0
                 decisions.extend([decision_yes, decision_no])
-                logger.warning(f"  SKIP ARB {opp.ticker}: cost ${actual_cost:.2f} > balance")
+                logger.warning(
+                    f"  SKIP ARB {opp.ticker}: cost ${actual_cost:.2f} > "
+                    f"remaining balance ${remaining_balance:.2f}"
+                )
                 continue
 
             # Place both sides
             if not dry_run and pairs > 0:
+                order_succeeded = True
                 for dec, side, price_c in [
                     (decision_yes, "yes", int(yes_price)),
                     (decision_no, "no", int(no_price)),
                 ]:
+                    side_cost = pairs * price_c / 100.0
+                    # Check remaining balance before each individual order
+                    if side_cost > remaining_balance:
+                        dec.error = f"insufficient balance (${remaining_balance:.2f} < ${side_cost:.2f})"
+                        logger.warning(
+                            f"  SKIP ARB {side.upper()} {opp.ticker}: "
+                            f"cost ${side_cost:.2f} > remaining ${remaining_balance:.2f}"
+                        )
+                        order_succeeded = False
+                        continue
                     try:
                         order_kwargs = {
                             "ticker": opp.ticker,
@@ -781,21 +834,29 @@ def run_arb_session(
                         order_id = result.get("order", {}).get("order_id", "unknown")
                         dec.placed = True
                         dec.order_id = order_id
+                        remaining_balance -= side_cost
                         logger.info(
                             f"  ARB ORDER: {side.upper()} {opp.ticker} x{pairs} "
-                            f"@ {price_c}c | total_edge +{opp.edge_cents:.1f}c | order_id={order_id}"
+                            f"@ {price_c}c | profit_after_fees +{profit_after_fees_cents:.1f}c "
+                            f"| order_id={order_id} | remaining=${remaining_balance:.2f}"
                         )
                     except Exception as e:
                         dec.error = str(e)
                         logger.error(f"  ARB ORDER FAILED: {side} {opp.ticker} -- {e}")
+                        order_succeeded = False
+                if order_succeeded:
+                    arb_capital_deployed += actual_cost
                 trades_placed += 1
             else:
                 if pairs > 0:
                     trades_placed += 1
+                    arb_capital_deployed += actual_cost
+                    remaining_balance -= actual_cost
                     logger.info(
                         f"  DRY-RUN ARB: would buy BOTH sides {opp.ticker} x{pairs} "
                         f"(YES@{yes_price}c + NO@{no_price}c = {total_cost_cents}c) "
-                        f"| edge +{opp.edge_cents:.1f}c | guaranteed ${opp.edge_cents * pairs / 100:.2f} profit"
+                        f"| profit_after_fees +{profit_after_fees_cents:.1f}c "
+                        f"| arb_deployed=${arb_capital_deployed:.2f}/{arb_capital_cap:.2f}"
                     )
 
             decisions.extend([decision_yes, decision_no])
@@ -825,7 +886,8 @@ def run_arb_session(
 
     logger.info(
         f"--- ARB SESSION DONE: {len(decisions)} decisions, "
-        f"{trades_placed} trades ---"
+        f"{trades_placed} trades, ${arb_capital_deployed:.2f} deployed "
+        f"(cap ${arb_capital_cap:.2f}) ---"
     )
     return decisions
 

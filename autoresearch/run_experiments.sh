@@ -12,7 +12,9 @@
 #
 # Logs: output/autoresearch_agent.log
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: intentionally no `set -e` — Claude exits non-zero on max-turns,
+# and we want the while loop to catch that and restart.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -42,17 +44,36 @@ echo "  Log: $LOG_FILE"
 echo "  Started: $(date)"
 echo "=============================================="
 
-# Refresh settlement data before starting
-echo "Refreshing settlement data..."
-python3 autoresearch/backtest_harness.py --refresh > /dev/null 2>&1 || true
+# Data refresh: settlement_tracker handles this on its 4h schedule
+# The backtest harness reads whatever data is already in output/
+echo "Using existing settlement data ($(wc -l < output/historical_settlements_with_prices.json 2>/dev/null || echo '?') lines)"
 
-# Launch Claude Code with the program.md prompt
-# The agent will loop autonomously until interrupted
-claude --print \
-  --model claude-sonnet-4-6 \
-  --allowedTools "Read,Write,Edit,Bash,Grep,Glob" \
-  "Hi, read autoresearch/program.md and let's kick off experiments. \
-Start by reading the program.md for full context, then read candidate_strategy.py \
-and run a baseline backtest. After that, begin the experiment loop. \
-Log results to autoresearch/results.tsv. Never stop." \
-  2>&1 | tee -a "$LOG_FILE"
+# Authentication: uses OAuth credentials from `claude` login (Max subscription)
+# Do NOT set ANTHROPIC_API_KEY or it will bill to API instead of subscription
+unset ANTHROPIC_API_KEY
+
+# Track total experiment batches across restarts
+RESTART_COUNT=0
+
+# Forever loop — when Claude hits max-turns it exits, we restart immediately
+while true; do
+    RESTART_COUNT=$((RESTART_COUNT + 1))
+    echo "" | tee -a "$LOG_FILE"
+    echo "=== Batch #$RESTART_COUNT starting at $(date) ===" | tee -a "$LOG_FILE"
+
+    claude -p \
+      --allowedTools "Read,Write,Edit,Bash(python3:*),Bash(grep:*),Bash(git:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Glob,Grep" \
+      --model claude-sonnet-4-6 \
+      --max-turns 200 \
+      "Read autoresearch/program.md for full context. Then read candidate_strategy.py \
+and run a baseline backtest with: python3 autoresearch/backtest_harness.py \
+After that, begin the experiment loop described in program.md. \
+Log every experiment to autoresearch/results.tsv. Never stop. \
+If you run out of ideas, load the historical settlements JSON and explore the data." \
+      2>&1 | stdbuf -oL tee -a "$LOG_FILE"
+
+    EXIT_CODE=$?
+    echo "" | tee -a "$LOG_FILE"
+    echo "=== Batch #$RESTART_COUNT ended (exit code $EXIT_CODE) at $(date). Restarting in 10s... ===" | tee -a "$LOG_FILE"
+    sleep 10
+done
