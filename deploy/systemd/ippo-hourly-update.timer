@@ -1,9 +1,0 @@
-[Unit]
-Description=Ippo Hourly Update Timer - Send status update every hour
-
-[Timer]
-OnCalendar=*-*-* *:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target

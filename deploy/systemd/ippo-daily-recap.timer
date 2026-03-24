@@ -1,9 +1,0 @@
-[Unit]
-Description=Ippo Daily Recap Timer - Send KPI recap at 11 PM UTC
-
-[Timer]
-OnCalendar=*-*-* 23:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
