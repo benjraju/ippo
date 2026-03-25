@@ -81,7 +81,7 @@ TARGET_MARKET_SERIES = [
     "KXETH",         # Ethereum daily range
     "KXSOL",         # Solana daily range
     "KXNBAGAME",     # NBA individual games
-    "KXNBAPTS",      # NBA player points
+    # "KXNBAPTS",    # DISABLED: NBA player props — no model, 27% win rate, -$18 leak
     "KXMARMAD",      # March Madness
 ]
 

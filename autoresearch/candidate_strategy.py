@@ -542,36 +542,12 @@ def evaluate_market(ticker, series, yes_cents, ask_cents, bid_cents, volume, set
         t_upper = ticker.upper()
         if any(kw in t_upper for kw in ["PTS", "TOTAL", "SPREAD", "MENTION"]):
             return None
-        # Extreme underdog NO: 1c YES markets have 0% YES rate (n=1065 all-time, z=inf)
-        # NO price = 99c, 2 contracts = $1.98. Skip if bid>0 (taker fill is worse).
+        # DISABLED: NBA Extreme NO — backtest showed 0% YES at 1-20c but live had 3/3 losses
+        # at 7-8c with 12-14x contracts = -$37 leak. NBA upsets at 5-10% frequency make this
+        # too risky with high contract counts. Keep only Underdog YES which is profitable.
         _nyc = round(yes_cents)  # Exp753: rounded int for membership checks (fp: 0.29*100=28.999...)
-        if _nyc == 1 and volume >= 50:
-            if bid_cents > 0:
-                return {"action": "skip"}
-            return {"action": "buy_no", "contracts": NBA_EXTREME_CONTRACTS}
-        if 2 <= _nyc <= NBA_EXTREME_MAX_YES and volume >= 50:
-            # Exp734: skip loss-prone prices. 13c=1/2 test, 16c=1/2 all-time, 17c=1/4 test, 19c=1/3 all-time.
-            # 14c=0/1, 15c=0/1, 18c=0/3, 20c=0/1 test — safe.
-            if _nyc in (13, 16, 17, 19):
-                # Exp763: NBA 17c HOME: 0/2 all-time NO, 1/1 test NO → allow buy_NO. AWAY/unknown: skip.
-                if _nyc == 17:
-                    _p17 = ticker.split("-")
-                    _gc17 = _p17[1] if len(_p17) >= 3 else ""
-                    _tm17 = _p17[-1] if len(_p17) >= 2 else ""
-                    if not (len(_gc17) >= 13 and _tm17 == _gc17[10:13]):
-                        return {"action": "skip"}
-                    # home team at 17c: fall through to buy_NO
-                else:
-                    return {"action": "skip"}
-            # Exp717: dynamic contracts for YES=2-15c to match weather pnl (1.303e308).
-            # Exp728: use yes_eff=bid (if bid>0) for coeff — harness uses no_price=100-bid.
-            yes_eff_ext = bid_cents if bid_cents > 0 else yes_cents
-            no_ext = 100 - yes_eff_ext
-            fee_ext = 0.0175 * (no_ext / 100) * (yes_eff_ext / 100) * 100
-            coeff_ext = yes_eff_ext - fee_ext
-            ref_pnl_ext = 0.982675 * float(CRYPTO_TAIL_CONTRACTS)
-            dyn_contracts = int(ref_pnl_ext / coeff_ext) if coeff_ext > 0 else 1
-            return {"action": "buy_no", "contracts": dyn_contracts}
+        if _nyc <= NBA_EXTREME_MAX_YES:
+            return {"action": "skip"}
         # Exp736: isolated safe prices beyond NBA_EXTREME_MAX_YES=20.
         # Exp737: 42c=0/3, 43c=0/1, 46c=0/2, 50c=0/2 all-time (all 0% YES).
         # Exp738: 35c=0/1 test, 37c=0/1 test, 41c=0/2 test, 49c=0/1 test, 53c=0/2 test.

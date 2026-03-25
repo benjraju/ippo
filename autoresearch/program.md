@@ -114,6 +114,9 @@ For new strategies that only use the standard `evaluate_market()` pattern (serie
 - **Trump/politics/mentions:** No model, no edge. Gambling.
 - **Crypto with < 30 days of data:** Cannot validate. Wait for more data.
 - **Mid-range tail fade (30-50c weather):** No proven edge. Old tail fade session was disabled for this reason.
+- **NBA Extreme NO (buy NO at 1-20c):** Backtest shows 0% YES rate but live trading went 3/3 YES at 7-8c with 12-14x contracts = -$37 loss. NBA upsets happen 5-10% and the downside per trade is catastrophic. DISABLED.
+- **NBA isolated-price NO (buy NO at 23c, 26c, 28c, etc.):** Same overfitting risk as Extreme NO. Small sample sizes (n=1-3) in backtest do not generalize. DISABLED for live.
+- **NBA complement NO (opposing home/away):** Backtested on 1-2 samples each. Not enough evidence for live trading.
 
 ### Known Biases to Exploit
 - **Favorite-longshot bias:** Markets systematically overprice longshots (low YES prices). This is why weather tail NO and NBA underdog YES work.
