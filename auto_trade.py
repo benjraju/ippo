@@ -1556,6 +1556,146 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         logger.error(f"Deep ITM session crashed: {e}")
         logger.error(traceback.format_exc())
 
+    # --- AutoResearch Evolved Strategy session ---
+    # Runs evaluate_market() from candidate_strategy.py on all live markets.
+    # This is the bridge between autoresearch discoveries and live trading.
+    # evaluate_market() returns astronomical contract counts from backtesting —
+    # we cap them to real position sizes via MAX_BET_DOLLARS.
+    try:
+        from autoresearch.candidate_strategy import evaluate_market
+        logger.info("--- AUTORESEARCH STRATEGY SESSION START ---")
+
+        # Collect tickers already traded this session to avoid duplicates
+        already_traded = {d.ticker for d in all_decisions if d.placed}
+
+        # Scan markets across all target series
+        ar_count = 0
+        ar_max = 20  # cap per cycle
+        ar_deployed = 0.0
+        ar_budget = balance * 0.20  # max 20% of balance for this session
+
+        for series_prefix in config.TARGET_MARKET_SERIES:
+            if ar_count >= ar_max or ar_deployed >= ar_budget:
+                break
+            try:
+                page = client.get_markets(series_ticker=series_prefix, status="open", limit=50)
+                markets = page.get("markets", [])
+            except Exception:
+                continue
+
+            for mkt in markets:
+                if ar_count >= ar_max or ar_deployed >= ar_budget:
+                    break
+
+                ticker = mkt.get("ticker", "")
+                if not ticker or ticker in already_traded:
+                    continue
+
+                series = mkt.get("series_ticker", "") or mkt.get("event_ticker", "").split("-")[0]
+                # Parse prices — API returns dollar strings like "0.3300"
+                try:
+                    yes_bid = int(float(mkt.get("yes_bid_dollars", 0) or 0) * 100)
+                    yes_ask = int(float(mkt.get("yes_ask_dollars", 0) or 0) * 100)
+                    last_price = int(float(mkt.get("last_price_dollars", 0) or 0) * 100)
+                    vol = int(float(mkt.get("volume_fp", 0) or mkt.get("volume", 0) or 0))
+                except (ValueError, TypeError):
+                    continue
+
+                yes_cents = last_price or yes_bid or yes_ask
+                if yes_cents <= 0 or yes_cents >= 100:
+                    continue
+
+                # Call the evolved strategy function
+                signal = evaluate_market(
+                    ticker=ticker,
+                    series=series,
+                    yes_cents=yes_cents,
+                    ask_cents=yes_ask,
+                    bid_cents=yes_bid,
+                    volume=vol,
+                    settled_yes=None,  # live trading
+                )
+
+                if not signal or signal.get("action") in (None, "skip"):
+                    continue
+
+                action = signal["action"]
+                # Cap contracts to real position sizes (backtest uses astronomical numbers)
+                raw_contracts = signal.get("contracts", 1)
+                if action == "buy_yes":
+                    entry_price = yes_ask if yes_ask > 0 else yes_cents
+                elif action == "buy_no":
+                    entry_price = 100 - (yes_bid if yes_bid > 0 else yes_cents)
+                else:
+                    continue
+
+                if entry_price <= 0 or entry_price >= 100:
+                    continue
+
+                cost_per = entry_price / 100.0
+                max_by_budget = int(config.MAX_BET_DOLLARS / cost_per) if cost_per > 0 else 0
+                contracts = max(1, min(raw_contracts, max_by_budget, 10))
+
+                total_cost = contracts * cost_per
+                if total_cost > config.MAX_BET_DOLLARS:
+                    contracts = int(config.MAX_BET_DOLLARS / cost_per)
+                if contracts <= 0:
+                    continue
+
+                side = "yes" if action == "buy_yes" else "no"
+                price_cents = entry_price
+
+                decision = TradeDecision(
+                    ticker=ticker,
+                    action=action,
+                    strategy="autoresearch",
+                    edge_cents=0,  # evaluate_market doesn't return edge
+                    fair_value_cents=0,
+                    market_price_cents=yes_cents,
+                    price_to_pay_cents=price_cents,
+                    contracts=contracts,
+                    max_loss_dollars=contracts * cost_per,
+                    reason=f"AutoResearch: {action} {side}@{price_cents}c x{contracts} (evolved strategy)",
+                    placed=False,
+                )
+
+                if not dry_run:
+                    try:
+                        order_kwargs = {
+                            "ticker": ticker,
+                            "side": side,
+                            "action": "buy",
+                            "count": contracts,
+                            "type": "limit",
+                        }
+                        if side == "yes":
+                            order_kwargs["yes_price"] = price_cents
+                        else:
+                            order_kwargs["no_price"] = price_cents
+                        result = client.place_order(**order_kwargs)
+                        decision.placed = True
+                        decision.order_id = result.get("order", {}).get("order_id", "")
+                        ar_deployed += contracts * cost_per
+                        ar_count += 1
+                        already_traded.add(ticker)
+                        logger.info(
+                            f"AUTORESEARCH: {ticker} {action.upper()} {side}@{price_cents}c x{contracts}"
+                        )
+                    except Exception as e:
+                        decision.error = str(e)
+                        logger.debug(f"AutoResearch order failed: {e}")
+                else:
+                    ar_count += 1
+                    logger.info(f"[DRY] AUTORESEARCH: {ticker} {action.upper()} {side}@{price_cents}c x{contracts}")
+                all_decisions.append(decision)
+
+        logger.info(f"--- AUTORESEARCH SESSION DONE: {ar_count} trades, ${ar_deployed:.2f} deployed ---")
+    except ImportError:
+        logger.info("--- AUTORESEARCH SESSION SKIPPED (candidate_strategy not found) ---")
+    except Exception as e:
+        logger.error(f"AutoResearch session crashed: {e}")
+        logger.error(traceback.format_exc())
+
     # --- Drawdown check ---
     total_risk = sum(d.max_loss_dollars for d in all_decisions if d.placed or (dry_run and d.contracts > 0))
     if balance > 0:
