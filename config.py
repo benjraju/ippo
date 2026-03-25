@@ -45,20 +45,20 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 # =============================================================================
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
 
-# Maximum percentage of account per single trade (2% = $2 on $100)
-MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.02"))
+# Maximum percentage of account per single trade (5% = $2.70 on $54)
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.05"))
 
 # Maximum dollar amount per single trade
-MAX_BET_DOLLARS = float(os.getenv("MAX_BET_DOLLARS", "2"))
+MAX_BET_DOLLARS = float(os.getenv("MAX_BET_DOLLARS", "5"))
 
-# Daily loss cap as percentage of account (8% = $8 on $100)
-MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.08"))
+# Daily loss cap as percentage of account (15% = $8 on $54)
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.15"))
 
-# Fractional Kelly criterion multiplier (0.25 = quarter Kelly, very conservative)
-KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
+# Fractional Kelly criterion multiplier (0.50 = half Kelly, moderate)
+KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.50"))
 
 # Maximum number of open positions at once
-MAX_OPEN_POSITIONS = 5
+MAX_OPEN_POSITIONS = 15
 
 # Minimum edge required to place a trade (estimated_prob - market_price)
 MIN_EDGE_THRESHOLD = 0.05  # 5 cents minimum edge

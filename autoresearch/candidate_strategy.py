@@ -50,7 +50,7 @@ HIGH_CONFIDENCE_EDGE = 7.0  # Above this = "high" confidence
 MEDIUM_CONFIDENCE_EDGE = 5.0  # Above this = "medium" confidence
 
 # Maximum position per single market (dollars)
-MAX_POSITION_DOLLARS = 5.0
+MAX_POSITION_DOLLARS = 10.0
 
 # Minimum volume to consider a market (contracts traded)
 MIN_VOLUME = 10
@@ -138,8 +138,8 @@ UNDERDOG_MAX_PRICE = 30  # Upper bound for entry
 UNDERDOG_MIN_PRICE = 18  # Lower bound (skip cheap underdogs with negative edge)
 
 # Position sizing
-UNDERDOG_MAX_BET_DOLLARS = 2  # Maximum dollars per underdog bet
-UNDERDOG_MAX_CONTRACTS = 20  # Maximum contracts per single trade
+UNDERDOG_MAX_BET_DOLLARS = 5  # Maximum dollars per underdog bet
+UNDERDOG_MAX_CONTRACTS = 30  # Maximum contracts per single trade
 
 # Market filter: 1 = Winner markets only (proven), 0 = include props too (unproven)
 UNDERDOG_WINNER_ONLY = 1
@@ -159,7 +159,7 @@ WEATHER_TAIL_MIN_NO_PROB = 0.90
 WEATHER_TAIL_MIN_EDGE = 0.5
 
 # Maximum contracts per tail trade
-WEATHER_TAIL_MAX_CONTRACTS = 3
+WEATHER_TAIL_MAX_CONTRACTS = 8
 
 
 # =============================================================================
@@ -170,10 +170,10 @@ WEATHER_TAIL_MAX_CONTRACTS = 3
 DEEP_ITM_BID_PRICE = 95
 
 # Maximum simultaneous deep ITM positions
-DEEP_ITM_MAX_POSITIONS = 10
+DEEP_ITM_MAX_POSITIONS = 20
 
 # Maximum % of bankroll per single deep ITM position
-DEEP_ITM_MAX_POSITION_PCT = 0.05
+DEEP_ITM_MAX_POSITION_PCT = 0.10
 
 # Minimum bid-ask spread to place a deep ITM order
 DEEP_ITM_MIN_SPREAD = 2
