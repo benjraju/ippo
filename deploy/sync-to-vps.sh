@@ -178,6 +178,19 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# Test: no rogue shadow files (autoresearch agent has created these before)
+echo -n "  No shadow files... "
+SHADOWS=$(ssh "${VPS}" "ls ${REMOTE_DIR}/numpy.py ${REMOTE_DIR}/dotenv.py ${REMOTE_DIR}/pandas.py 2>/dev/null" || true)
+if [ -z "$SHADOWS" ]; then
+    echo "OK"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL — rogue files: $SHADOWS"
+    ssh "${VPS}" "rm -f ${REMOTE_DIR}/numpy.py ${REMOTE_DIR}/dotenv.py ${REMOTE_DIR}/pandas.py ${REMOTE_DIR}/__pycache__/numpy* ${REMOTE_DIR}/__pycache__/dotenv* ${REMOTE_DIR}/__pycache__/pandas*"
+    echo "  (auto-cleaned)"
+    FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "======================================================"
 if [ "${FAIL}" -eq 0 ]; then

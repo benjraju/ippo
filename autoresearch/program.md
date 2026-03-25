@@ -147,6 +147,7 @@ These are hypotheses, not instructions. Test them. Most will fail. That's the pr
 8. **Log every experiment.** Append to `results.tsv` with enough detail that a human can understand what you tried and why it worked or didn't.
 9. **Never stop.** The human may be asleep. If you run out of ideas, re-read the data. Load the settlements JSON and explore it with Python. Plot distributions. Calculate statistics. The data will tell you where the edge is.
 10. **When you find something big, say so clearly.** If you discover a new strategy with z > 3.0, put `[BREAKTHROUGH]` in the commit message and results.tsv entry.
+11. **NEVER create new Python files.** You may only edit `candidate_strategy.py`. If an import fails, report the error — do not create stub files, shims, or workarounds. Creating files like `numpy.py` or `dotenv.py` in the project root will shadow installed packages and break the entire trading bot.
 
 ## 6. Success Metrics
 

@@ -55,6 +55,16 @@ unset ANTHROPIC_API_KEY
 # Track total experiment batches across restarts
 RESTART_COUNT=0
 
+# Guard: remove any rogue shadow files that could poison imports
+# (the autoresearch agent has created these before, breaking all services)
+for shadow in numpy.py dotenv.py pandas.py requests.py scipy.py; do
+    if [ -f "$PROJECT_DIR/$shadow" ]; then
+        echo "WARNING: Removing rogue shadow file $shadow" | tee -a "$LOG_FILE"
+        rm -f "$PROJECT_DIR/$shadow"
+        rm -f "$PROJECT_DIR/__pycache__/${shadow%.py}"*
+    fi
+done
+
 # Forever loop — when Claude hits max-turns it exits, we restart immediately
 while true; do
     RESTART_COUNT=$((RESTART_COUNT + 1))
@@ -62,7 +72,7 @@ while true; do
     echo "=== Batch #$RESTART_COUNT starting at $(date) ===" | tee -a "$LOG_FILE"
 
     claude -p \
-      --allowedTools "Read,Write,Edit,Bash(python3:*),Bash(grep:*),Bash(git:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Glob,Grep" \
+      --allowedTools "Read,Edit,Bash(python3:*),Bash(grep:*),Bash(git:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Glob,Grep" \
       --model claude-sonnet-4-6 \
       --max-turns 200 \
       "Read autoresearch/program.md for full context. Then read candidate_strategy.py \
