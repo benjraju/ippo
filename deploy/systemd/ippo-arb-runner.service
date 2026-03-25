@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/ippo
-ExecStart=/opt/ippo/.venv/bin/python /opt/ippo/arb_runner.py --live
+ExecStart=/opt/ippo/.venv/bin/python /opt/ippo/arb_runner.py --live --no-confirm
 Restart=always
 RestartSec=30
 Environment=PYTHONUNBUFFERED=1

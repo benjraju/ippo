@@ -23,6 +23,8 @@ import time
 import traceback
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
+
+_args = None  # Set by __main__ block; used by run_continuous for --no-confirm
 from pathlib import Path
 from typing import Optional
 
@@ -459,7 +461,7 @@ def run_continuous(dry_run: bool = True):
         logger.critical(f"Failed to connect: {e}")
         return
 
-    if not dry_run:
+    if not dry_run and not getattr(_args, 'no_confirm', False):
         print("\n  WARNING: LIVE MODE — Real orders will be placed!")
         confirm = input("  Type 'YES' to continue: ")
         if confirm != "YES":
@@ -531,10 +533,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="YES/NO Arbitrage Runner")
     parser.add_argument("--dry-run", action="store_true", default=True, help="Scan only, don't trade")
     parser.add_argument("--live", action="store_true", help="Execute real trades")
+    parser.add_argument("--no-confirm", action="store_true", help="Skip interactive confirmation (for systemd)")
     parser.add_argument("--scan-once", action="store_true", help="Single scan, then exit")
     args = parser.parse_args()
 
     is_dry_run = not args.live
+    _args = args  # noqa: F841 — used by run_continuous for --no-confirm
 
     if args.scan_once:
         logger = setup_logger(dry_run=is_dry_run)
