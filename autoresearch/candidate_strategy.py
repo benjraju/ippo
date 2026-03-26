@@ -456,8 +456,9 @@ def evaluate_market(ticker, series, yes_cents, ask_cents, bid_cents, volume,
     # --- Crypto tail NO: PAUSED — 32% win rate live, -$5.36 P&L ---
     # Backtested well but losing in production. Same overfitting pattern as NBA Extreme NO.
     # Keeping code for autoresearch backtesting but skipping in live trading.
+    eth_max = 36 if series == "KXETH" else CRYPTO_TAIL_MAX_YES  # needed by ETH sections below
     if series.startswith(("KXBTC", "KXETH", "KXSOL")):
-        if 0 < yes_cents <= 36 and volume >= 1:
+        if 0 < yes_cents <= eth_max and volume >= 1:
             return {"action": "skip"}
 
     # --- BTC near-certain YES: 31c ask=33 settled YES (Exp752) ---

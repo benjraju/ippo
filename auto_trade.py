@@ -1699,10 +1699,14 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         logger.error(traceback.format_exc())
 
     # --- Drawdown check ---
+    # Use ACCOUNT_BALANCE (portfolio value) not just cash for drawdown calc.
+    # When most capital is deployed in positions, cash is near-zero and any
+    # trade would trigger a false drawdown alert.
     total_risk = sum(d.max_loss_dollars for d in all_decisions if d.placed or (dry_run and d.contracts > 0))
-    if balance > 0:
-        dd_pct = (total_risk / balance) * 100
-        if alert_drawdown and dd_pct >= 5.0:
+    account_value = max(balance, config.ACCOUNT_BALANCE)  # use whichever is higher
+    if account_value > 0:
+        dd_pct = (total_risk / account_value) * 100
+        if alert_drawdown and dd_pct >= 15.0:  # aligned with MAX_DAILY_LOSS_PCT
             alert_drawdown(dd_pct, balance)
 
     # --- Summary ---
