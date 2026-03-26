@@ -72,7 +72,7 @@ while true; do
     echo "=== Batch #$RESTART_COUNT starting at $(date) ===" | tee -a "$LOG_FILE"
 
     claude -p \
-      --allowedTools "Read,Edit,Bash(python3:*),Bash(grep:*),Bash(git:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Glob,Grep" \
+      --allowedTools "Read,Edit,Bash(python3:*),Bash(python3.14:*),Bash(python:*),Bash(grep:*),Bash(git:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Glob,Grep" \
       --model claude-sonnet-4-6 \
       --max-turns 200 \
       "Read autoresearch/program.md for full context. Then read candidate_strategy.py \
