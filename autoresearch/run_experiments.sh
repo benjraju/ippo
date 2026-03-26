@@ -72,14 +72,16 @@ while true; do
     echo "=== Batch #$RESTART_COUNT starting at $(date) ===" | tee -a "$LOG_FILE"
 
     claude -p \
-      --allowedTools "Read,Edit,Bash(python3:*),Bash(python3.14:*),Bash(python:*),Bash(grep:*),Bash(git:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Glob,Grep" \
+      --allowedTools "Read,Edit,Bash(python3:*),Bash(python3.14:*),Bash(python:*),Bash(grep:*),Bash(git:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Glob,Grep" \
       --model claude-sonnet-4-6 \
       --max-turns 200 \
-      "Read autoresearch/program.md for full context. Then read candidate_strategy.py \
-and run a baseline backtest with: python3 autoresearch/backtest_harness.py \
-After that, begin the experiment loop described in program.md. \
-Log every experiment to autoresearch/results.tsv. Never stop. \
-If you run out of ideas, load the historical settlements JSON and explore the data." \
+      "Read autoresearch/program.md for instructions. \
+Then run a baseline backtest: python3 autoresearch/backtest_harness.py \
+Begin the experiment loop. Only read candidate_strategy.py in small sections \
+using offset/limit — do NOT read the entire file at once (it is large). \
+Edit specific sections with the Edit tool. Keep candidate_strategy.py under 500 lines. \
+If it exceeds 500 lines, refactor: remove dead code, consolidate duplicate logic, \
+delete commented-out blocks. Log experiments to autoresearch/results.tsv. Never stop." \
       2>&1 | stdbuf -oL tee -a "$LOG_FILE"
 
     EXIT_CODE=$?
