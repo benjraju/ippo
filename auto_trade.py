@@ -1606,6 +1606,7 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                     continue
 
                 # Call the evolved strategy function
+                oi = int(float(mkt.get("open_interest", 0) or 0))
                 signal = evaluate_market(
                     ticker=ticker,
                     series=series,
@@ -1613,6 +1614,7 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                     ask_cents=yes_ask,
                     bid_cents=yes_bid,
                     volume=vol,
+                    open_interest=oi,
                     settled_yes=None,  # live trading
                 )
 

@@ -338,7 +338,8 @@ def get_strategy_params():
 # Return {"action": "buy_yes"|"buy_no", "contracts": N} to trade,
 # or None / {"action": "skip"} to pass.
 
-def evaluate_market(ticker, series, yes_cents, ask_cents, bid_cents, volume, settled_yes=None):
+def evaluate_market(ticker, series, yes_cents, ask_cents, bid_cents, volume,
+                    open_interest=0, settled_yes=None):
     """
     Core strategy decision function. Called by backtest_harness.py for each market.
 
@@ -352,6 +353,7 @@ def evaluate_market(ticker, series, yes_cents, ask_cents, bid_cents, volume, set
         ask_cents: YES ask price in cents
         bid_cents: YES bid price in cents
         volume: Total volume traded
+        open_interest: Open interest in contracts (0 if unavailable)
         settled_yes: True if settled YES, False if NO (None during live trading)
 
     Returns:

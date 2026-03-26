@@ -65,6 +65,11 @@ for shadow in numpy.py dotenv.py pandas.py requests.py scipy.py; do
     fi
 done
 
+# Refresh settlement data before starting (get latest settled markets)
+echo "Refreshing settlement data..." | tee -a "$LOG_FILE"
+"$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/autoresearch/backtest_harness.py" --refresh 2>&1 | tail -5 | tee -a "$LOG_FILE"
+echo "" | tee -a "$LOG_FILE"
+
 # Forever loop — when Claude hits max-turns it exits, we restart immediately
 while true; do
     RESTART_COUNT=$((RESTART_COUNT + 1))

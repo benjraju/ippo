@@ -155,6 +155,7 @@ These are hypotheses, not instructions. Test them. Most will fail. That's the pr
 12. **NEVER read entire large files at once.** Use `offset` and `limit` parameters with the Read tool to read sections of candidate_strategy.py (e.g., `Read offset=300 limit=100`). Reading the whole file fills your context and causes "Prompt is too long" errors.
 13. **Keep contract counts reasonable.** Use integers 1-200 for contract counts. Never use astronomical numbers (10³⁰⁰+) — they worked in backtesting but overflow in live trading and bloat the file with unreadable numbers.
 14. **Actively refactor.** If candidate_strategy.py exceeds 500 lines, refactor before adding new strategies: remove dead code after `return skip`, consolidate duplicate sizing logic into helper functions, delete commented-out experiments.
+15. **New signal available: `open_interest`.** The evaluate_market() signature now includes `open_interest` (contracts). Use it to filter illiquid markets or find edges based on OI levels. Settlement data is auto-refreshed before each session.
 
 ## 6. Success Metrics
 

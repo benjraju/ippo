@@ -77,6 +77,7 @@ def load_settlements(series_filter: str = None) -> list[dict]:
         m["yes_ask"] = float(m.get("prev_yes_ask", 0) or 0)
         m["yes_bid"] = float(m.get("prev_yes_bid", 0) or 0)
         m["vol"] = float(m.get("volume", 0) or 0)
+        m["open_interest"] = float(m.get("open_interest", 0) or 0)
         m["settled_yes"] = m["result"] == "yes"
 
         settled.append(m)
@@ -89,13 +90,85 @@ def load_settlements(series_filter: str = None) -> list[dict]:
 def refresh_settlements():
     """Pull fresh settlement data from Kalshi API."""
     try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
         from kalshi_client import KalshiClient
-        from settlement_tracker import refresh_historical_settlements
+        import config
+
+        client = KalshiClient()
         print("Refreshing settlement data from Kalshi API...")
-        refresh_historical_settlements()
-        print("Done.")
-    except ImportError as e:
+
+        all_markets = []
+        for series in config.TARGET_MARKET_SERIES:
+            cursor = None
+            for _ in range(20):  # max 20 pages per series
+                kwargs = {
+                    "series_ticker": series,
+                    "status": "settled",
+                    "limit": 200,
+                }
+                if cursor:
+                    kwargs["cursor"] = cursor
+                try:
+                    resp = client.get_markets(**kwargs)
+                except Exception as e:
+                    print(f"  {series}: error {e}")
+                    break
+
+                markets = resp.get("markets", [])
+                if not markets:
+                    break
+
+                for m in markets:
+                    record = {
+                        "ticker": m.get("ticker", ""),
+                        "series": m.get("series_ticker", ""),
+                        "title": m.get("title", ""),
+                        "result": m.get("result", ""),
+                        "previous_price": str(m.get("previous_yes_price", m.get("last_price_dollars", 0)) or 0),
+                        "prev_yes_ask": str(m.get("previous_yes_ask", m.get("yes_ask_dollars", 0)) or 0),
+                        "prev_yes_bid": str(m.get("previous_yes_bid", m.get("yes_bid_dollars", 0)) or 0),
+                        "volume": str(m.get("volume", m.get("volume_fp", 0)) or 0),
+                        "open_interest": str(m.get("open_interest", 0) or 0),
+                        "last_price": str(m.get("last_price_dollars", 0) or 0),
+                        "close_time": m.get("close_time", ""),
+                    }
+                    if record["result"]:
+                        all_markets.append(record)
+
+                cursor = resp.get("cursor")
+                if not cursor:
+                    break
+
+            print(f"  {series}: {sum(1 for m in all_markets if m.get('series', '').startswith(series))} settled markets")
+
+        # Merge with existing data (keep markets not in this fetch)
+        existing = {}
+        if SETTLEMENTS_FILE.exists():
+            with open(SETTLEMENTS_FILE) as f:
+                data = json.load(f)
+            for m in data.get("markets", []):
+                existing[m.get("ticker", "")] = m
+
+        # Update with fresh data
+        for m in all_markets:
+            existing[m["ticker"]] = m
+
+        output = {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "total": len(existing),
+            "markets": list(existing.values()),
+        }
+
+        with open(SETTLEMENTS_FILE, "w") as f:
+            json.dump(output, f)
+
+        print(f"Done. {len(existing)} total markets ({len(all_markets)} refreshed).")
+
+    except Exception as e:
         print(f"Cannot refresh: {e}")
+        import traceback
+        traceback.print_exc()
         print("Using existing data.")
 
 
@@ -149,16 +222,30 @@ def evaluate_strategy(markets: list[dict]) -> dict:
 
         # Call the strategy's evaluate function if it exists
         decision = None
+        oi = m.get("open_interest", 0)
         if hasattr(strat, "evaluate_market"):
-            decision = strat.evaluate_market(
-                ticker=ticker,
-                series=series,
-                yes_cents=yes_cents,
-                ask_cents=ask_cents,
-                bid_cents=bid_cents,
-                volume=vol,
-                settled_yes=settled_yes,
-            )
+            try:
+                decision = strat.evaluate_market(
+                    ticker=ticker,
+                    series=series,
+                    yes_cents=yes_cents,
+                    ask_cents=ask_cents,
+                    bid_cents=bid_cents,
+                    volume=vol,
+                    open_interest=oi,
+                    settled_yes=settled_yes,
+                )
+            except TypeError:
+                # Fallback for old signature without open_interest
+                decision = strat.evaluate_market(
+                    ticker=ticker,
+                    series=series,
+                    yes_cents=yes_cents,
+                    ask_cents=ask_cents,
+                    bid_cents=bid_cents,
+                    volume=vol,
+                    settled_yes=settled_yes,
+                )
 
         if decision is None:
             # Fallback: use the built-in tail/underdog logic from params
