@@ -78,6 +78,7 @@ def load_settlements(series_filter: str = None) -> list[dict]:
         m["yes_bid"] = float(m.get("prev_yes_bid", 0) or 0)
         m["vol"] = float(m.get("volume", 0) or 0)
         m["open_interest"] = float(m.get("open_interest", 0) or 0)
+        m["last_price_dollars"] = float(m.get("last_price", 0) or 0)
         m["settled_yes"] = m["result"] == "yes"
 
         settled.append(m)
@@ -223,6 +224,8 @@ def evaluate_strategy(markets: list[dict]) -> dict:
         # Call the strategy's evaluate function if it exists
         decision = None
         oi = m.get("open_interest", 0)
+        last_price = m.get("last_price_dollars", 0)
+        prev_price = m.get("yes_price", 0)  # previous_price (before settlement)
         if hasattr(strat, "evaluate_market"):
             try:
                 decision = strat.evaluate_market(
@@ -233,19 +236,33 @@ def evaluate_strategy(markets: list[dict]) -> dict:
                     bid_cents=bid_cents,
                     volume=vol,
                     open_interest=oi,
+                    last_price=last_price,
+                    previous_price=prev_price,
                     settled_yes=settled_yes,
                 )
             except TypeError:
-                # Fallback for old signature without open_interest
-                decision = strat.evaluate_market(
-                    ticker=ticker,
-                    series=series,
-                    yes_cents=yes_cents,
-                    ask_cents=ask_cents,
-                    bid_cents=bid_cents,
-                    volume=vol,
-                    settled_yes=settled_yes,
-                )
+                # Fallback for old signature
+                try:
+                    decision = strat.evaluate_market(
+                        ticker=ticker,
+                        series=series,
+                        yes_cents=yes_cents,
+                        ask_cents=ask_cents,
+                        bid_cents=bid_cents,
+                        volume=vol,
+                        open_interest=oi,
+                        settled_yes=settled_yes,
+                    )
+                except TypeError:
+                    decision = strat.evaluate_market(
+                        ticker=ticker,
+                        series=series,
+                        yes_cents=yes_cents,
+                        ask_cents=ask_cents,
+                        bid_cents=bid_cents,
+                        volume=vol,
+                        settled_yes=settled_yes,
+                    )
 
         if decision is None:
             # Fallback: use the built-in tail/underdog logic from params
