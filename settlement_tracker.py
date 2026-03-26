@@ -37,6 +37,12 @@ from rich.panel import Panel
 import config
 from kalshi_client import KalshiClient
 
+try:
+    from brier_tracker import BrierTracker
+    _brier = BrierTracker()
+except ImportError:
+    _brier = None
+
 console = Console()
 
 # ---------------------------------------------------------------------------
@@ -162,15 +168,41 @@ def fetch_actual_high_temp(station_id: str, date_str: str) -> Optional[float]:
 # Ticker / Market Parsing
 # ---------------------------------------------------------------------------
 
-def classify_strategy(ticker: str) -> str:
-    """Classify a ticker into a strategy category."""
+def classify_strategy(ticker: str, side: str = "", entry_price: float = 0) -> str:
+    """Classify a ticker into a strategy category.
+
+    Uses ticker, side, and entry price to distinguish between sub-strategies:
+    - weather_tail vs weather (mid-range)
+    - nba_underdog vs nba_props vs nba_other
+    """
     ticker_upper = ticker.upper()
+
+    # Weather markets
     if any(ticker_upper.startswith(s) for s in ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLA", "KXHIGHDC", "KXHIGHDEN"]):
+        if entry_price >= 85 and "no" in side.lower():
+            return "weather_tail"
+        elif entry_price <= 15 and "yes" in side.lower():
+            return "weather_tail"
         return "weather"
-    elif any(ticker_upper.startswith(s) for s in ["KXBTC", "KXETH", "KXSOL"]):
-        return "crypto"
+
+    # NBA game winners
+    elif ticker_upper.startswith("KXNBAGAME"):
+        if "yes" in side.lower() and entry_price <= 30:
+            return "nba_underdog"
+        return "sports"
+
+    # NBA player props
+    elif ticker_upper.startswith("KXNBAPTS"):
+        return "nba_props"
+
+    # Other sports
     elif any(ticker_upper.startswith(s) for s in ["KXNBA", "KXNHL", "KXMLB", "KXNCAA", "KXMARMAD"]):
         return "sports"
+
+    # Crypto
+    elif any(ticker_upper.startswith(s) for s in ["KXBTC", "KXETH", "KXSOL"]):
+        return "crypto"
+
     return "other"
 
 
@@ -305,9 +337,7 @@ class SettlementTracker:
             status = market.get("status", "unknown")
             result = market.get("result", "")  # "yes" or "no" for settled
 
-            strategy = classify_strategy(ticker)
-
-            # Compute net position from fills
+            # Compute net position from fills (strategy classified after we know side+price)
             net_yes = 0
             total_cost = 0.0
             for fill in ticker_fills:
@@ -364,10 +394,13 @@ class SettlementTracker:
 
             cumulative_pnl += pnl
 
+            # Classify strategy using ticker, side, and entry price
+            strategy = classify_strategy(ticker, side=side_label, entry_price=entry_price)
+
             # Extract weather data if applicable
             forecast_temp = None
             actual_temp = None
-            if strategy == "weather":
+            if strategy in ("weather", "weather_tail"):
                 # Always look up forecast (capture it while JSON logs are fresh)
                 forecast_temp = self._lookup_forecast_temp(ticker)
                 # Only fetch actual temp once market has settled
@@ -398,6 +431,15 @@ class SettlementTracker:
                 actual_temp=actual_temp,
             )
             records.append(record)
+
+            # Record outcome for Brier calibration
+            if _brier is not None and settlement_result in ("yes", "no"):
+                try:
+                    outcome = 1.0 if settlement_result == "yes" else 0.0
+                    _brier.record_outcome(ticker, outcome)
+                except Exception:
+                    pass
+
             time.sleep(0.3)  # Rate limiting
 
         return records

@@ -22,14 +22,12 @@ LOG_FILE="$PROJECT_DIR/output/autoresearch_agent.log"
 
 cd "$PROJECT_DIR"
 
-# Ensure we're on a dedicated branch
-BRANCH="autoresearch/$(date +%b%d | tr '[:upper:]' '[:lower:]')"
+# Stay on whatever branch we're on (rsync deploys from local main).
+# AutoResearch commits improvements directly — they get picked up by
+# live trading immediately via the evaluate_market() bridge, and
+# can be pulled back to local with: git fetch && git log origin/master
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "none")
-
-if [[ "$CURRENT_BRANCH" != autoresearch/* ]]; then
-    echo "Creating experiment branch: $BRANCH"
-    git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
-fi
+echo "Working on branch: $CURRENT_BRANCH"
 
 # Initialize results.tsv if it doesn't exist
 RESULTS_TSV="$SCRIPT_DIR/results.tsv"

@@ -36,16 +36,16 @@ except ImportError:
 
 # Setup logging
 LOG_FILE = config.OUTPUT_DIR / "weather_tail_runner.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)-7s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(),
-    ],
-)
 log = logging.getLogger("weather_tail_runner")
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    _fmt = logging.Formatter("[%(asctime)s] %(levelname)-7s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    _fh = logging.FileHandler(LOG_FILE)
+    _fh.setFormatter(_fmt)
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_fmt)
+    log.handlers = [_fh, _sh]
 
 
 def get_balance(client):

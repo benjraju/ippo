@@ -1568,6 +1568,18 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         # Collect tickers already traded this session to avoid duplicates
         already_traded = {d.ticker for d in all_decisions if d.placed}
 
+        # Also exclude markets where we already hold positions (from weather_tail_runner, arb_runner, etc.)
+        try:
+            positions = client.get_positions()
+            for mp in positions.get("market_positions", []):
+                pos = float(mp.get("position", mp.get("position_fp", 0)))
+                if pos != 0:
+                    already_traded.add(mp.get("ticker", ""))
+            if already_traded:
+                logger.info(f"AutoResearch dedup: {len(already_traded)} tickers excluded (session + existing positions)")
+        except Exception as e:
+            logger.warning(f"AutoResearch dedup: could not fetch positions: {e}")
+
         # Scan markets across all target series
         ar_count = 0
         ar_max = 20  # cap per cycle
