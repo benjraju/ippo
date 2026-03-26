@@ -85,5 +85,46 @@ If you run out of ideas, load the historical settlements JSON and explore the da
     EXIT_CODE=$?
     echo "" | tee -a "$LOG_FILE"
     echo "=== Batch #$RESTART_COUNT ended (exit code $EXIT_CODE) at $(date). Restarting in 10s... ===" | tee -a "$LOG_FILE"
+
+    # ── Post-batch health check: catch rogue files IMMEDIATELY ──
+    POISONED=0
+    for shadow in numpy.py dotenv.py pandas.py requests.py scipy.py; do
+        if [ -f "$PROJECT_DIR/$shadow" ]; then
+            echo "ALERT: Rogue shadow file $shadow detected after batch #$RESTART_COUNT!" | tee -a "$LOG_FILE"
+            rm -f "$PROJECT_DIR/$shadow"
+            rm -f "$PROJECT_DIR/__pycache__/${shadow%.py}"*
+            POISONED=1
+        fi
+    done
+
+    # Also check autoresearch/ directory for shadow files
+    for shadow in numpy.py dotenv.py pandas.py requests.py scipy.py; do
+        if [ -f "$SCRIPT_DIR/$shadow" ]; then
+            echo "ALERT: Rogue shadow file autoresearch/$shadow detected!" | tee -a "$LOG_FILE"
+            rm -f "$SCRIPT_DIR/$shadow"
+            POISONED=1
+        fi
+    done
+
+    # Verify imports still work
+    IMPORT_OK=$("$PROJECT_DIR/.venv/bin/python" -c "import numpy; from dotenv import load_dotenv; import config; print('OK')" 2>&1)
+    if [ "$IMPORT_OK" != "OK" ]; then
+        echo "ALERT: Import health check FAILED after batch #$RESTART_COUNT: $IMPORT_OK" | tee -a "$LOG_FILE"
+        POISONED=1
+    fi
+
+    # Send Telegram alert if anything went wrong
+    if [ "$POISONED" -eq 1 ]; then
+        "$PROJECT_DIR/.venv/bin/python" -c "
+from alerts import send_telegram
+send_telegram(
+    '<b>AUTORESEARCH ALERT</b>\n\n'
+    'Rogue files or import failure detected after batch #$RESTART_COUNT.\n'
+    'Files auto-cleaned. Trading services should be unaffected.\n'
+    'Check: journalctl -u ippo-auto-trade -n 10'
+)" 2>/dev/null
+        echo "Telegram alert sent." | tee -a "$LOG_FILE"
+    fi
+
     sleep 10
 done

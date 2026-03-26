@@ -1,0 +1,10 @@
+[Unit]
+Description=Ippo Watchdog Timer - Health check every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:15,45:00
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

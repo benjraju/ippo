@@ -1,0 +1,19 @@
+[Unit]
+Description=Ippo Watchdog - Health monitor with Telegram alerts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ippo
+ExecStart=/opt/ippo/.venv/bin/python /opt/ippo/watchdog.py
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=60
+
+MemoryMax=128M
+
+StandardOutput=append:/opt/ippo/output/watchdog.log
+StandardError=append:/opt/ippo/output/watchdog.log
+
+[Install]
+WantedBy=default.target
