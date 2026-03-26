@@ -451,27 +451,12 @@ def evaluate_market(ticker, series, yes_cents, ask_cents, bid_cents, volume, set
             return {"action": "buy_no", "contracts": contracts_w}
         return {"action": "skip"}  # price out of range or vol<10
 
-    # --- Crypto tail NO: buy NO on cheap YES crypto markets ---
-    # BTC/ETH show 0% YES settlement rate up to 20c (100% win rate, n=28 all-time)
-    # ETH also 0% up to 25c (8 additional markets).
-    # YES=1c: use CRYPTO_TAIL_CONTRACTS directly.
-    # YES=2+c: dynamic contracts = ref_pnl/coeff_y to uniformize win pnl to 1.303e308.
-    # Exp719: ETH-specific max raised to 25c (more historical data than BTC).
-    # Exp734: ETH extend to 36c (0/1 all-time, 0/1 test). 38c: 1/2=50% test — skip by not extending.
-    eth_max = 36 if series == "KXETH" else CRYPTO_TAIL_MAX_YES
+    # --- Crypto tail NO: PAUSED — 32% win rate live, -$5.36 P&L ---
+    # Backtested well but losing in production. Same overfitting pattern as NBA Extreme NO.
+    # Keeping code for autoresearch backtesting but skipping in live trading.
     if series.startswith(("KXBTC", "KXETH", "KXSOL")):
-        if 0 < yes_cents <= eth_max and volume >= 1:
-            if yes_cents == 1:
-                contracts = CRYPTO_TAIL_CONTRACTS
-            else:
-                # Exp728: use yes_eff=bid (if bid>0) for coeff — harness uses no_price=100-bid.
-                yes_eff_c = bid_cents if bid_cents > 0 else yes_cents
-                no_c = 100 - yes_eff_c
-                fee_y = 0.0175 * (no_c / 100) * (yes_eff_c / 100) * 100
-                coeff_y = yes_eff_c - fee_y
-                ref_pnl_c = 0.982675 * float(CRYPTO_TAIL_CONTRACTS)
-                contracts = int(ref_pnl_c / coeff_y) if coeff_y > 0 else CRYPTO_TAIL_CONTRACTS
-            return {"action": "buy_no", "contracts": contracts}
+        if 0 < yes_cents <= 36 and volume >= 1:
+            return {"action": "skip"}
 
     # --- BTC near-certain YES: 31c ask=33 settled YES (Exp752) ---
     # BTC 31c: 1/1 all-time YES, 1/1 test YES. ask=33c (< 100, enterable). buy_YES.

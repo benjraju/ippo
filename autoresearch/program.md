@@ -117,6 +117,7 @@ For new strategies that only use the standard `evaluate_market()` pattern (serie
 - **NBA Extreme NO (buy NO at 1-20c):** Backtest shows 0% YES rate but live trading went 3/3 YES at 7-8c with 12-14x contracts = -$37 loss. NBA upsets happen 5-10% and the downside per trade is catastrophic. DISABLED.
 - **NBA isolated-price NO (buy NO at 23c, 26c, 28c, etc.):** Same overfitting risk as Extreme NO. Small sample sizes (n=1-3) in backtest do not generalize. DISABLED for live.
 - **NBA complement NO (opposing home/away):** Backtested on 1-2 samples each. Not enough evidence for live trading.
+- **Crypto tail NO (BTC/ETH/SOL buy NO at low YES):** 32% win rate live vs 100% in backtest. -$5.36 P&L on 34 trades. PAUSED — same overfitting pattern as NBA Extreme NO.
 
 ### Known Biases to Exploit
 - **Favorite-longshot bias:** Markets systematically overprice longshots (low YES prices). This is why weather tail NO and NBA underdog YES work.
