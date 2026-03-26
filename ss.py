@@ -101,11 +101,19 @@ def check_balance():
                 qty = abs(int(p.get("total_traded", p.get("position", 0)) or 0))
                 pos_value += qty * 0.50  # rough estimate
 
+        # Get portfolio value (cash + positions)
+        try:
+            portfolio = client._request("GET", "/portfolio/balance")
+            total_cents = portfolio.get("portfolio_value", 0) or 0
+            total_equity = total_cents / 100.0
+        except Exception:
+            total_equity = cash + pos_value  # fallback
+
         print(f"  Cash:              ${cash:.2f}")
         print(f"  Open positions:    {open_count}")
-        print(f"  Est. position val: ~${pos_value:.2f}")
-        print(f"  Est. total equity: ~${cash + pos_value:.2f}")
+        print(f"  Total equity:      ${total_equity:.2f}  (from Kalshi)")
         print(f"  Started:           ${STARTING_BALANCE:.2f}")
+        print(f"  Real P&L:          ${total_equity - STARTING_BALANCE:+.2f}  ({(total_equity - STARTING_BALANCE) / STARTING_BALANCE * 100:+.1f}%)")
         return cash, open_count
     except Exception as e:
         print(f"  ERROR: {e}")
@@ -289,9 +297,8 @@ def show_strategy_performance():
 
         print(f"  {cat:22s} {t:5d} {s['open']:5d} {s['wins']:4d} {s['losses']:4d} {wr:>5s} {s['pnl']:+8.2f} {verdict}")
 
-    print(f"\n  Active P&L:   ${active_pnl:+.2f}")
-    print(f"  Total P&L:    ${total_pnl:+.2f}")
-    print(f"  If no leaks:  ~${STARTING_BALANCE + active_pnl:.2f}")
+    print(f"\n  CSV settled P&L:  ${total_pnl:+.2f}")
+    print(f"  (Use Kalshi balance above for real account value)")
 
 
 # ── 5. AutoResearch Status ──────────────────────────────────────────────
