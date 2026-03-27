@@ -43,13 +43,13 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 # =============================================================================
 # RISK MANAGEMENT — SAFE DEFAULTS FOR $100 ACCOUNT
 # =============================================================================
-ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "580"))
 
-# Maximum percentage of account per single trade (5% = $2.70 on $54)
+# Maximum percentage of account per single trade (5% = $29 on $580)
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.05"))
 
 # Maximum dollar amount per single trade
-MAX_BET_DOLLARS = float(os.getenv("MAX_BET_DOLLARS", "5"))
+MAX_BET_DOLLARS = float(os.getenv("MAX_BET_DOLLARS", "15"))
 
 # Daily loss cap as percentage of account (15% = $8 on $54)
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.15"))
