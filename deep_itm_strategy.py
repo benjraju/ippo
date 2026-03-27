@@ -234,12 +234,26 @@ def find_deep_itm_opportunities(
             if not markets:
                 break
 
-            for m in markets:
-                yes_ask = m.get("yes_ask")
-                yes_bid = m.get("yes_bid")
-                volume = m.get("volume", 0)
+            # Convert dollar strings to cents (Kalshi API returns "0.9500" etc.)
+            def to_cents(val):
+                if val is None:
+                    return 0
+                try:
+                    return int(float(val) * 100)
+                except (ValueError, TypeError):
+                    return 0
 
-                if yes_ask is None or yes_bid is None:
+            for m in markets:
+                yes_ask = to_cents(m.get("yes_ask_dollars") or m.get("yes_ask") or 0)
+                yes_bid = to_cents(m.get("yes_bid_dollars") or m.get("yes_bid") or 0)
+
+                vol_raw = m.get("volume_fp") or m.get("volume") or 0
+                try:
+                    volume = int(float(vol_raw))
+                except (ValueError, TypeError):
+                    volume = 0
+
+                if yes_ask == 0 or yes_bid == 0:
                     continue
 
                 # Filter: ask must be >= our threshold

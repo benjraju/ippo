@@ -1167,10 +1167,7 @@ def run_dutch_book_session(
             total_yes_bid = 0
             legs = []
             for mkt in event_markets:
-                yes_bid = float(mkt.get("yes_bid", 0) or 0)
-                # Normalize: if < 1.0, it's dollars
-                if 0 < yes_bid < 1.0:
-                    yes_bid = yes_bid * 100
+                yes_bid = int(float(mkt.get("yes_bid_dollars", 0) or 0) * 100)
                 total_yes_bid += yes_bid
                 legs.append({
                     "ticker": mkt.get("ticker", ""),
@@ -1310,7 +1307,7 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         logger.critical("Cannot proceed without account balance")
         return
 
-    if balance < 1.0:
+    if balance < 0.10:
         logger.critical(f"Account balance too low (${balance:.2f}), aborting")
         return
 
@@ -1455,10 +1452,14 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             tail_trades = find_weather_tail_trades(client)
             risk = tail_risk_budget(balance)
             for tt in tail_trades[:5]:  # max 5 tail trades per cycle
-                contracts = min(tt.get("suggested_contracts", 1), risk.get("max_contracts", 5))
+                # Use risk budget for contract count (suggested_contracts is never set by weather_tail_strategy)
+                max_contracts = min(risk.get("max_contracts", 5), 3)  # cap at 3 per the strategy design
+                price_cents = int(tt.get("no_price_cents", 97))
+                cost_per = price_cents / 100.0
+                contracts_by_budget = int(config.MAX_BET_DOLLARS / cost_per) if cost_per > 0 else 1
+                contracts = max(1, min(contracts_by_budget, max_contracts))
                 if contracts <= 0:
                     continue
-                price_cents = int(tt.get("no_price_cents", 97))
                 decision = TradeDecision(
                     ticker=tt["ticker"],
                     action="buy_no",
