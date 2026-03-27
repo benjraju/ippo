@@ -1393,19 +1393,23 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                 )
                 if not dry_run:
                     try:
+                        # Bid 1c below ask to stay as maker order (post_only default)
+                        # If ask=13c, we bid 12c and wait for a fill
+                        maker_price = max(1, price_cents - 1)
                         result = client.place_order(
                             ticker=decision.ticker,
                             side="yes",
                             action="buy",
                             count=contracts,
                             type="limit",
-                            yes_price=price_cents,
+                            yes_price=maker_price,
                         )
                         decision.placed = True
+                        decision.price_to_pay_cents = maker_price
                         decision.order_id = result.get("order", {}).get("order_id", "")
                         logger.info(
                             f"NBA UNDERDOG: {decision.ticker} BUY YES x{contracts} "
-                            f"@{price_cents}c edge={ud.get('edge_pp',0):+.1f}pp"
+                            f"@{maker_price}c (ask={price_cents}c) edge={ud.get('edge_pp',0):+.1f}pp"
                         )
                     except Exception as e:
                         decision.error = str(e)
