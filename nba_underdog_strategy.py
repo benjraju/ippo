@@ -243,21 +243,24 @@ def find_nba_underdogs(client: KalshiClient = None) -> list[dict]:
         ticker = mkt.get("ticker", "")
         title = mkt.get("title", "")
 
-        # Get order book for current prices
+        # Get best YES ask price. Try orderbook first, fall back to market summary.
+        best_yes_ask = None
         try:
             ob = client.get_market_orderbook(ticker, depth=3)
             book = ob.get("orderbook", {})
+            yes_asks = book.get("yes", [])
+            if yes_asks:
+                best_yes_ask = yes_asks[0][0]  # [[price, qty], ...]
         except Exception:
-            continue
+            pass
 
-        # Find best YES ask (cheapest we can buy YES for)
-        yes_asks = book.get("yes", [])
-        if not yes_asks:
-            continue
-
-        # yes_asks is [[price, quantity], ...] sorted ascending
-        best_yes_ask = yes_asks[0][0] if yes_asks else None
+        # Fallback: use market summary ask price if orderbook is empty
         if best_yes_ask is None:
+            ask_dollars = mkt.get("yes_ask_dollars") or mkt.get("yes_ask")
+            if ask_dollars:
+                best_yes_ask = int(float(ask_dollars) * 100)
+
+        if best_yes_ask is None or best_yes_ask <= 0:
             continue
 
         # Check if in underdog range
