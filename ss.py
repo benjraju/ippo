@@ -18,7 +18,7 @@ from pathlib import Path
 
 # ── Config ──────────────────────────────────────────────────────────────
 OUTPUT = Path("/opt/ippo/output")
-STARTING_BALANCE = 98.0
+TOTAL_DEPOSITED = 588.0  # $98 initial + $490 on Mar 27
 
 
 def section(title):
@@ -101,23 +101,25 @@ def check_balance():
                 qty = abs(int(p.get("total_traded", p.get("position", 0)) or 0))
                 pos_value += qty * 0.50  # rough estimate
 
-        # Get portfolio value (cash + positions)
+        # Total equity = cash + positions value (from balance API)
         try:
             portfolio = client._request("GET", "/portfolio/balance")
-            total_cents = portfolio.get("portfolio_value", 0) or 0
-            total_equity = total_cents / 100.0
+            pos_cents = portfolio.get("portfolio_value", 0) or 0
+            total_equity = cash + pos_cents / 100.0
         except Exception:
             total_equity = cash + pos_value  # fallback
 
+        net_pnl = total_equity - TOTAL_DEPOSITED
+
         print(f"  Cash:              ${cash:.2f}")
-        print(f"  Open positions:    {open_count}")
-        print(f"  Total equity:      ${total_equity:.2f}  (from Kalshi)")
-        print(f"  Started:           ${STARTING_BALANCE:.2f}")
-        print(f"  Real P&L:          ${total_equity - STARTING_BALANCE:+.2f}  ({(total_equity - STARTING_BALANCE) / STARTING_BALANCE * 100:+.1f}%)")
-        return cash, open_count
+        print(f"  Positions:         ${total_equity - cash:.2f}")
+        print(f"  Total equity:      ${total_equity:.2f}")
+        print(f"  Total deposited:   ${TOTAL_DEPOSITED:.2f}")
+        print(f"  Net P&L:           ${net_pnl:+.2f}  ({net_pnl / TOTAL_DEPOSITED * 100:+.1f}%)")
+        return cash, open_count, total_equity
     except Exception as e:
         print(f"  ERROR: {e}")
-        return 0, 0
+        return 0, 0, 0
 
 
 # ── 3. Today's Trades ──────────────────────────────────────────────────
@@ -383,7 +385,88 @@ def show_autoresearch():
         print(f"    - {d}")
 
 
-# ── 6. Summary ──────────────────────────────────────────────────────────
+# ── 6. Daily P&L Tracker ────────────────────────────────────────────────
+def show_daily_pnl(total_equity):
+    section("DAY-BY-DAY P&L")
+
+    # Load tracker
+    tracker_path = OUTPUT / "daily_portfolio.json"
+    deposits = [
+        ("2026-03-21", 98.0),
+        ("2026-03-27", 490.0),
+    ]
+
+    # Historical + today
+    days = [
+        ("2026-03-21", 98.00),
+        ("2026-03-22", 89.00),
+        ("2026-03-23", 86.00),
+        ("2026-03-24", 84.87),
+        ("2026-03-25", 53.77),
+        ("2026-03-26", 89.16),
+    ]
+
+    # Try to load saved daily snapshots
+    if tracker_path.exists():
+        try:
+            with open(tracker_path) as f:
+                saved = json.load(f)
+            for e in saved.get("entries", []):
+                d = e.get("date", "")
+                pv = e.get("total_equity", e.get("portfolio_value", 0))
+                if pv > 0 and d not in [x[0] for x in days]:
+                    days.append((d, pv))
+        except Exception:
+            pass
+
+    # Add/update today
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    days = [(d, v) for d, v in days if d != today]
+    if total_equity > 0:
+        days.append((today, total_equity))
+    days.sort()
+
+    # Save today's snapshot
+    try:
+        saved_data = {"entries": [], "deposits": [{"date": d, "amount": a} for d, a in deposits]}
+        if tracker_path.exists():
+            with open(tracker_path) as f:
+                saved_data = json.load(f)
+        existing_dates = {e["date"] for e in saved_data.get("entries", [])}
+        if today not in existing_dates:
+            saved_data.setdefault("entries", []).append({
+                "date": today,
+                "total_equity": total_equity,
+                "time": datetime.now(timezone.utc).isoformat(),
+            })
+        else:
+            for e in saved_data["entries"]:
+                if e["date"] == today:
+                    e["total_equity"] = total_equity
+        with open(tracker_path, "w") as f:
+            json.dump(saved_data, f, indent=2)
+    except Exception:
+        pass
+
+    print(f"  {'Date':12s} {'Portfolio':>10s} {'Deposited':>10s} {'Net P&L':>10s} {'Day Chg':>10s}")
+    print(f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+
+    prev_pnl = None
+    for date, portfolio in days:
+        cum_deposits = sum(a for d, a in deposits if d <= date)
+        net_pnl = portfolio - cum_deposits
+        day_chg = (net_pnl - prev_pnl) if prev_pnl is not None else 0.0
+        prev_pnl = net_pnl
+        print(f"  {date:12s} ${portfolio:9.2f} ${cum_deposits:9.2f} ${net_pnl:+9.2f} ${day_chg:+9.2f}")
+
+    cum_all = sum(a for _, a in deposits)
+    if days:
+        final = days[-1][1]
+        net = final - cum_all
+        print(f"\n  Net P&L: ${net:+.2f} ({net/cum_all*100:+.1f}%) on ${cum_all:.0f} deposited")
+
+
+# ── 7. Summary ──────────────────────────────────────────────────────────
 def show_summary(services_ok, cash, open_positions):
     section("SUMMARY")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -402,7 +485,8 @@ if __name__ == "__main__":
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     services_ok = check_services()
-    cash, open_pos = check_balance()
+    cash, open_pos, total_equity = check_balance()
+    show_daily_pnl(total_equity)
     show_todays_trades()
     show_strategy_performance()
     show_autoresearch()
