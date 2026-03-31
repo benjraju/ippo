@@ -75,9 +75,9 @@ MAX_BID_PRICE = 97          # Our maximum bid price (cents)
 MIN_BID_PRICE = 95          # Our minimum bid price (cents)
 DEFAULT_BID_PRICE = DEEP_ITM_BID_PRICE   # Bid price from autoresearch (default 95c)
 WIN_RATE = 0.9958           # Empirical win rate at >= 95c from 3,603 settled markets
-MAX_SINGLE_POSITION_PCT = DEEP_ITM_MAX_POSITION_PCT   # Max % of bankroll on one market
-MAX_TOTAL_DEPLOYED_PCT = 0.30    # Max 30% of bankroll deployed total
-MIN_POSITIONS = 10          # Minimum number of positions for diversification
+MAX_SINGLE_POSITION_PCT = DEEP_ITM_MAX_POSITION_PCT   # Max % of bankroll on one market (10% = $58 on $580)
+MAX_TOTAL_DEPLOYED_PCT = 0.35    # Max 35% of bankroll deployed total ($203 on $580)
+MIN_POSITIONS = 8           # Minimum number of positions for diversification
 MAX_POSITIONS = DEEP_ITM_MAX_POSITIONS   # Maximum simultaneous positions from autoresearch
 MIN_VOLUME = 100            # Minimum market volume to consider
 MAKER_FEE_RATE = 0.0175     # Kalshi maker fee rate
@@ -215,8 +215,11 @@ def find_deep_itm_opportunities(
     """
     opportunities = []
 
-    # Scan all configured series
+    # Scan all configured series (skip blocked ones)
+    blocked = getattr(config, "BLOCKED_SERIES", set())
     for series in config.TARGET_MARKET_SERIES:
+        if series in blocked:
+            continue
         cursor = None
         for page in range(10):  # Max 10 pages per series
             try:
@@ -244,6 +247,12 @@ def find_deep_itm_opportunities(
                     return 0
 
             for m in markets:
+                # Skip markets from blocked series (e.g., KXNBAPTS from KXNBA parent query)
+                m_ticker = m.get("ticker", "")
+                m_series = m.get("series_ticker", "") or (m_ticker.split("-")[0] if "-" in m_ticker else "")
+                if m_series in blocked or (m_ticker.split("-")[0] if "-" in m_ticker else "") in blocked:
+                    continue
+
                 yes_ask = to_cents(m.get("yes_ask_dollars") or m.get("yes_ask") or 0)
                 yes_bid = to_cents(m.get("yes_bid_dollars") or m.get("yes_bid") or 0)
 

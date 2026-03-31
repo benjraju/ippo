@@ -50,6 +50,50 @@ FORECAST_STDEV = {
     3: 4.5,   # 3 days out
 }
 
+# ---------------------------------------------------------------------------
+# Per-city bias correction (degrees F to SUBTRACT from raw forecast)
+# ---------------------------------------------------------------------------
+# Derived from forecast_accuracy.csv analysis (2026-03-21 through 2026-03-23):
+#   Denver: forecasts run hot by ~4.7F (mean error -4.7F, i.e., forecast - actual = +4.7)
+#   Miami:  forecasts run slightly hot by ~2.8F
+#   NYC:    well-calibrated (mean error -0.9F, within noise)
+#   Chicago: disabled (weight=0.0) due to catastrophic errors (7-16F)
+#   LA/DC:  no data yet, assume zero bias
+#
+# Convention: bias > 0 means forecast tends to be HIGHER than actual.
+# Corrected forecast = raw_forecast - bias.
+CITY_FORECAST_BIAS = {
+    "NYC":     0.0,    # Well-calibrated: errors -0.3 to -1.7F (slight cold bias, not significant)
+    "Chicago": 0.0,    # Disabled (weight=0.0), but if re-enabled, needs separate analysis
+    "Miami":   2.8,    # Forecasts run hot: errors +1.8 to +3.8F, mean ~+2.8F
+    "LA":      0.0,    # No data yet
+    "DC":      0.0,    # No data yet
+    "Denver":  4.7,    # Forecasts run hot: errors -4.7 to -4.8F consistently
+}
+
+# Per-city forecast uncertainty multipliers
+# Cities with high forecast variance get wider stdev, cities with low variance get tighter
+# This scales the base FORECAST_STDEV by a per-city factor
+CITY_STDEV_MULTIPLIER = {
+    "NYC":     0.85,   # Well-calibrated, errors typically < 2F -- tighter bands
+    "Chicago": 2.5,    # Catastrophic errors (7-16F) -- very wide bands if re-enabled
+    "Miami":   1.1,    # Moderate errors (1.8-3.8F after bias correction) -- slightly wide
+    "LA":      1.0,    # No data yet, use base
+    "DC":      1.0,    # No data yet, use base
+    "Denver":  1.3,    # After bias correction residuals ~0-1F, but mountain weather is volatile
+}
+
+# Per-city minimum edge (cents) required to trade
+# Higher for unreliable cities, lower for well-calibrated ones
+CITY_MIN_EDGE_CENTS = {
+    "NYC":     3.0,    # Well-calibrated -- standard threshold
+    "Chicago": 15.0,   # If re-enabled, require huge edge to compensate for forecast noise
+    "Miami":   4.0,    # Slight premium for moderate bias
+    "LA":      5.0,    # Unknown calibration -- conservative
+    "DC":      5.0,    # Unknown calibration -- conservative
+    "Denver":  5.0,    # Higher threshold due to mountain weather volatility
+}
+
 
 @dataclass
 class WeatherEdge:
@@ -112,6 +156,33 @@ def normal_cdf(x: float) -> float:
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
+def apply_bias_correction(forecast_temp: float, city: str = "") -> float:
+    """
+    Apply per-city bias correction to a raw forecast temperature.
+
+    Returns the corrected forecast (raw - bias). If city is unknown or empty,
+    returns the raw forecast unchanged.
+    """
+    bias = CITY_FORECAST_BIAS.get(city, 0.0)
+    return forecast_temp - bias
+
+
+def get_city_stdev(base_stdev: float, city: str = "") -> float:
+    """
+    Scale base forecast stdev by per-city multiplier.
+
+    Cities with historically high forecast error get wider uncertainty bands.
+    Cities with good calibration get tighter bands.
+    """
+    multiplier = CITY_STDEV_MULTIPLIER.get(city, 1.0)
+    return base_stdev * multiplier
+
+
+def get_city_min_edge(city: str = "") -> float:
+    """Return the minimum edge threshold (cents) for a given city."""
+    return CITY_MIN_EDGE_CENTS.get(city, 3.0)
+
+
 def calc_bucket_probability(
     forecast_temp: float,
     bucket_low: float,
@@ -121,6 +192,10 @@ def calc_bucket_probability(
     """
     Calculate probability that actual temp falls in [bucket_low, bucket_high].
     Uses normal distribution centered on forecast with given stdev.
+
+    NOTE: For bias-corrected forecasts, apply apply_bias_correction() to
+    forecast_temp BEFORE calling this function, and use get_city_stdev()
+    for the stdev parameter.
     """
     z_low = (bucket_low - forecast_temp) / stdev
     z_high = (bucket_high - forecast_temp) / stdev
@@ -214,9 +289,11 @@ def find_weather_edges(client: KalshiClient = None) -> list[WeatherEdge]:
     Main strategy function: find all weather market edges.
 
     1. Fetch NWS forecasts for each city
-    2. Get Kalshi market prices
-    3. Calculate fair values using forecast + uncertainty model
-    4. Return edges sorted by magnitude
+    2. Apply per-city bias correction (Denver runs hot by ~4.7F, etc.)
+    3. Get Kalshi market prices
+    4. Calculate fair values using bias-corrected forecast + city-scaled uncertainty
+    5. Apply per-city minimum edge thresholds
+    6. Return edges sorted by magnitude
     """
     client = client or KalshiClient()
     all_edges = []
@@ -242,6 +319,9 @@ def find_weather_edges(client: KalshiClient = None) -> list[WeatherEdge]:
             markets = resp.get("markets", [])
         except Exception:
             continue
+
+        # Per-city minimum edge threshold
+        min_edge = get_city_min_edge(city)
 
         # Match each market to a forecast period
         for m in markets:
@@ -288,7 +368,11 @@ def find_weather_edges(client: KalshiClient = None) -> list[WeatherEdge]:
             if market_date not in forecast_periods:
                 continue
 
-            forecast_temp = forecast_periods[market_date]["temperature"]
+            raw_forecast_temp = forecast_periods[market_date]["temperature"]
+
+            # Apply per-city bias correction
+            # Denver forecasts run hot by ~4.7F, Miami by ~2.8F
+            forecast_temp = apply_bias_correction(raw_forecast_temp, city)
 
             # Calculate stdev based on how far out the date is
             now = datetime.now(timezone.utc)
@@ -298,9 +382,11 @@ def find_weather_edges(client: KalshiClient = None) -> list[WeatherEdge]:
             except Exception:
                 days_out = 1
 
-            stdev = FORECAST_STDEV.get(min(days_out, 3), 4.0)
+            base_stdev = FORECAST_STDEV.get(min(days_out, 3), 4.0)
+            # Scale stdev by per-city uncertainty multiplier
+            stdev = get_city_stdev(base_stdev, city)
 
-            # Calculate fair value
+            # Calculate fair value using bias-corrected forecast and city-scaled stdev
             if mtype["type"] == "bucket":
                 fair_prob = calc_bucket_probability(
                     forecast_temp, mtype["low"], mtype["high"], stdev
@@ -328,7 +414,7 @@ def find_weather_edges(client: KalshiClient = None) -> list[WeatherEdge]:
             buy_edge = fair_value_cents - buy_price
             sell_edge = sell_price - fair_value_cents
 
-            if buy_edge > 3:  # At least 3 cents edge to buy YES
+            if buy_edge > min_edge:  # Per-city minimum edge threshold
                 all_edges.append(WeatherEdge(
                     ticker=ticker,
                     title=title[:60],
@@ -344,7 +430,7 @@ def find_weather_edges(client: KalshiClient = None) -> list[WeatherEdge]:
                     confidence="high" if buy_edge > 10 else "medium" if buy_edge > 5 else "low",
                     volume=volume,
                 ))
-            elif sell_edge > 3:  # At least 3 cents edge to sell (buy NO)
+            elif sell_edge > min_edge:  # Per-city minimum edge threshold
                 all_edges.append(WeatherEdge(
                     ticker=ticker,
                     title=title[:60],

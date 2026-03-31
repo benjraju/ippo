@@ -71,9 +71,12 @@ SERIES_TICKER = "KXNBAGAME"
 MIN_YES_PRICE_CENTS = UNDERDOG_MIN_PRICE
 MAX_YES_PRICE_CENTS = UNDERDOG_MAX_PRICE
 ESTIMATED_WIN_RATE = 0.297    # Historical win rate for 10-30c underdogs (not mutated by autoresearch)
-DEFAULT_BANKROLL = 75.0
+DEFAULT_BANKROLL = 580.0      # Updated 2026-03-28 for $580 account
 MAX_DAILY_BETS = 5
-MAX_BET_DOLLARS = UNDERDOG_MAX_BET_DOLLARS
+# Cap MAX_BET_DOLLARS to a sane value to prevent autoresearch overflow numbers
+# At $580 bankroll, 1% per trade = $5.80 -- conservative for 25% win rate strategy
+_raw_max_bet = UNDERDOG_MAX_BET_DOLLARS
+MAX_BET_DOLLARS = min(float(_raw_max_bet), 6.0) if _raw_max_bet > 100 else float(_raw_max_bet)
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +166,11 @@ def nba_risk_budget(
     """
     Compute risk budget for NBA underdog bets.
 
-    Conservative sizing: max $2 per trade, max 5 per day.
-    Total daily exposure capped at $10 (13% of $75 bankroll).
+    At $580 bankroll with ~25% win rate:
+    - Max $6 per trade (~1% of bankroll)
+    - Max 5 per day
+    - Total daily exposure capped at $30 (5.2% of bankroll)
+    - These are speculative bets: wins pay 3-9x but lose 75% of the time
 
     Args:
         bankroll: Current account balance
@@ -174,8 +180,9 @@ def nba_risk_budget(
     Returns:
         dict with max_bet_dollars, max_daily_bets, max_contracts_at_price, etc.
     """
-    # Cap single bet at lesser of $2 or 3% of bankroll
-    effective_max = min(max_bet_dollars, bankroll * 0.03)
+    # Cap single bet at lesser of max_bet_dollars or 1% of bankroll.
+    # 1% = $5.80 on $580. Conservative for a 25% win rate strategy.
+    effective_max = min(max_bet_dollars, bankroll * 0.01)
 
     # Contracts at common price points
     contracts = {}
@@ -283,6 +290,15 @@ def find_nba_underdogs(client: KalshiClient = None) -> list[dict]:
         ticker_parts = ticker.split("-")
         team_code = ticker_parts[-1] if len(ticker_parts) >= 3 else "?"
 
+        # Compute suggested contracts using quarter Kelly and bankroll cap
+        cost_cents = best_yes_ask
+        cost_dollars = cost_cents / 100.0
+        qk = kelly_info["quarter_kelly"]
+        # Quarter Kelly fraction of bankroll, capped by MAX_BET_DOLLARS
+        kelly_budget = DEFAULT_BANKROLL * qk
+        budget_capped = min(kelly_budget, MAX_BET_DOLLARS)
+        suggested = max(1, int(budget_capped / cost_dollars)) if cost_dollars > 0 else 1
+
         trades.append({
             "ticker": ticker,
             "title": title,
@@ -300,7 +316,7 @@ def find_nba_underdogs(client: KalshiClient = None) -> list[dict]:
             "cost_per_contract": kelly_info["cost_per_contract"],
             "net_win_per_contract": kelly_info["net_win_per_contract"],
             "fee_per_contract": kelly_info["fee_per_contract"],
-            "suggested_contracts": 1,  # conservative default
+            "suggested_contracts": suggested,
         })
 
         time.sleep(0.2)  # rate limit between orderbook calls

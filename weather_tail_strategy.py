@@ -55,7 +55,7 @@ try:
 except ImportError:
     WEATHER_TAIL_MAX_YES = 15
     WEATHER_TAIL_MIN_NO_PROB = 0.90
-    WEATHER_TAIL_MIN_EDGE = 0.5
+    WEATHER_TAIL_MIN_EDGE = 1.5  # Raised from 0.5: 0.5c edge is noise on 97c NO
     WEATHER_TAIL_MAX_CONTRACTS = 3
 from kalshi_client import KalshiClient
 from dutch_book import (
@@ -73,7 +73,10 @@ from weather_strategy import (
     calc_below_probability,
     parse_market_type,
     normal_cdf,
+    apply_bias_correction,
+    get_city_stdev,
     FORECAST_STDEV,
+    CITY_FORECAST_BIAS,
 )
 
 console = Console()
@@ -86,7 +89,7 @@ MAX_YES_PRICE_CENTS = WEATHER_TAIL_MAX_YES
 MIN_NO_PROBABILITY = WEATHER_TAIL_MIN_NO_PROB
 MIN_NET_EDGE_CENTS = WEATHER_TAIL_MIN_EDGE
 MAX_CONTRACTS_PER_TRADE = WEATHER_TAIL_MAX_CONTRACTS
-DEFAULT_BANKROLL = 75.0      # Default bankroll for risk budgeting
+DEFAULT_BANKROLL = 580.0     # Default bankroll for risk budgeting (updated 2026-03-28)
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +162,7 @@ def compute_tail_kelly(
 
 def tail_risk_budget(
     bankroll: float,
-    max_single_loss_pct: float = 0.10,
+    max_single_loss_pct: float = 0.08,
 ) -> dict:
     """
     Compute maximum position size for tail trades.
@@ -167,7 +170,7 @@ def tail_risk_budget(
     Key constraint: when a tail event DOES happen (0.14% of the time for
     extreme tails, up to 2% for near-tails), the loss is large.
 
-    At 10 contracts buying NO at 97c, loss = $9.70 = 13% of $75 bankroll.
+    At 8 contracts buying NO at 97c, loss = $7.76 = 1.3% of $580 bankroll.
     We need to size so that a single tail event loss is survivable.
 
     Args:
@@ -175,21 +178,24 @@ def tail_risk_budget(
         max_single_loss_pct: Max loss on any single tail trade as fraction of bankroll
 
     Returns:
-        {
-            "max_risk_dollars": float,       # Max dollars at risk per tail trade
-            "example_97c_contracts": int,    # Max contracts if NO costs 97c
-            "example_95c_contracts": int,    # Max contracts if NO costs 95c
-            "expected_loss_frequency": str,  # How often tail losses happen
-        }
+        dict with max_risk_dollars, max_contracts, and example sizing
     """
     max_risk = bankroll * max_single_loss_pct
 
     # Example sizing for common NO prices
+    contracts_99 = int(max_risk / 0.99) if max_risk >= 0.99 else 0
     contracts_97 = int(max_risk / 0.97) if max_risk >= 0.97 else 0
     contracts_95 = int(max_risk / 0.95) if max_risk >= 0.95 else 0
 
+    # Default max_contracts: conservative estimate at 97c NO price, capped at 8
+    # At $580 bankroll, 8% risk = $46.40, at 97c that's 47 contracts.
+    # But we cap at 8 for safety -- that's $7.76 max loss (1.3% of bankroll).
+    max_contracts = min(contracts_97, 8)
+
     return {
         "max_risk_dollars": round(max_risk, 2),
+        "max_contracts": max_contracts,
+        "example_99c_contracts": contracts_99,
         "example_97c_contracts": contracts_97,
         "example_95c_contracts": contracts_95,
         "expected_loss_frequency": (
@@ -277,7 +283,12 @@ def find_weather_tail_trades(client: KalshiClient = None) -> list[dict]:
                 if not market_date or market_date not in forecast_by_date:
                     continue
 
-                forecast_temp = forecast_by_date[market_date]["temperature"]
+                raw_temp = forecast_by_date[market_date]["temperature"]
+
+                # Apply per-city bias correction (same as auto_trade.py blending).
+                # Denver forecasts run 4.7F hot, Miami 2.8F hot. Without this,
+                # we overestimate high-temp probabilities and misprice tail trades.
+                forecast_temp = apply_bias_correction(raw_temp, city)
 
                 # Calculate days out for stdev
                 now = datetime.now(timezone.utc)
@@ -289,7 +300,9 @@ def find_weather_tail_trades(client: KalshiClient = None) -> list[dict]:
                 except Exception:
                     days_out = 1
 
-                stdev = FORECAST_STDEV.get(min(days_out, 3), 4.0)
+                base_stdev = FORECAST_STDEV.get(min(days_out, 3), 4.0)
+                # Apply per-city stdev scaling (wider for volatile cities like Chicago)
+                stdev = get_city_stdev(base_stdev, city)
 
                 # 3. Compute our model's probability for this bucket
                 if mtype["type"] == "bucket":
@@ -455,10 +468,13 @@ def display_tail_trades(trades: list[dict]):
     budget = tail_risk_budget(DEFAULT_BANKROLL)
     console.print(
         f"\n  Risk budget (${DEFAULT_BANKROLL:.0f} bankroll, "
-        f"{budget['max_risk_dollars']:.0f}% max loss):"
+        f"max {budget['max_contracts']} contracts/trade):"
     )
     console.print(
         f"    Max risk/trade: ${budget['max_risk_dollars']:.2f}"
+    )
+    console.print(
+        f"    Max contracts (capped): {budget['max_contracts']}"
     )
     console.print(
         f"    Max contracts @ 97c NO: {budget['example_97c_contracts']}"

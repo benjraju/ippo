@@ -64,12 +64,15 @@ MAX_ARBS_PER_SESSION = 20      # Cap per run
 MAX_DAILY_ARB_COST = 20.0      # Total daily budget for arbs
 DAILY_LOSS_CAP_PCT = 0.08      # 8% of account
 
-# Target series to scan
-ARB_TARGET_SERIES = [
-    "KXBTC", "KXETH", "KXSOL",         # Crypto (highest frequency)
+# Target series to scan (filtered by BLOCKED_SERIES from config)
+_ARB_ALL_SERIES = [
     "KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA",  # Weather
     "KXHIGHLA", "KXHIGHDEN", "KXHIGHDC",
+    # Crypto removed 2026-03-28: -70% ROI, 15% WR. No real-time price feeds.
+    # "KXBTC", "KXETH", "KXSOL",
 ]
+_blocked = getattr(config, "BLOCKED_SERIES", set())
+ARB_TARGET_SERIES = [s for s in _ARB_ALL_SERIES if s not in _blocked]
 
 OUTPUT_DIR = config.OUTPUT_DIR
 LOG_FILE = OUTPUT_DIR / f"arb_runner_{datetime.now().strftime('%Y-%m-%d')}.log"
@@ -255,6 +258,16 @@ def execute_arb(
 ) -> dict:
     """
     Execute a YES/NO arb: buy both sides simultaneously.
+
+    SAFETY: Re-checks the orderbook right before execution to verify
+    the arb still exists.  Places limit orders AT the ask price
+    (post_only=False so they fill immediately as taker orders).
+
+    Using taker orders is intentional here: the whole point of arb is
+    guaranteed profit, so paying taker fees is acceptable as long as
+    edge_net > 0 AFTER taker fees.  If we used maker orders (post_only=True),
+    only one side would fill and we'd have directional exposure.
+
     Returns dict with execution details.
     """
     result = {
@@ -281,7 +294,56 @@ def execute_arb(
         )
         return result
 
-    # Live execution: place both orders
+    # Pre-execution: re-check orderbook to confirm the arb still exists
+    try:
+        ob = client.get_market_orderbook(signal.ticker, depth=3)
+        book = ob.get("orderbook", {})
+        yes_asks = book.get("yes", [])
+        no_asks = book.get("no", [])
+
+        if not yes_asks or not no_asks:
+            result["error"] = "Orderbook empty on re-check"
+            logger.warning(f"  ARB ABORTED {signal.ticker}: orderbook empty on re-check")
+            return result
+
+        current_yes_ask = min(yes_asks, key=lambda x: x[0])
+        current_no_ask = min(no_asks, key=lambda x: x[0])
+        current_total = current_yes_ask[0] + current_no_ask[0]
+
+        # Recalculate with taker fees (since we need immediate fills)
+        TAKER_RATE = 0.07
+        yes_fee = TAKER_RATE * current_yes_ask[0] * (100 - current_yes_ask[0]) / 100.0
+        no_fee = TAKER_RATE * current_no_ask[0] * (100 - current_no_ask[0]) / 100.0
+        current_edge = 100 - current_total - yes_fee - no_fee
+
+        if current_edge < MIN_EDGE_AFTER_FEES_CENTS:
+            result["error"] = (
+                f"Arb evaporated: asks now {current_yes_ask[0]}+{current_no_ask[0]}="
+                f"{current_total}c, edge={current_edge:.1f}c < {MIN_EDGE_AFTER_FEES_CENTS}c"
+            )
+            logger.info(f"  ARB EVAPORATED {signal.ticker}: {result['error']}")
+            return result
+
+        # Check depth: both sides must have enough contracts
+        fill_qty = min(signal.max_contracts, current_yes_ask[1], current_no_ask[1])
+        if fill_qty < 1:
+            result["error"] = f"Insufficient depth: YES={current_yes_ask[1]}, NO={current_no_ask[1]}"
+            logger.warning(f"  ARB ABORTED {signal.ticker}: {result['error']}")
+            return result
+
+        # Update signal with confirmed prices
+        signal.yes_ask = current_yes_ask[0]
+        signal.no_ask = current_no_ask[0]
+        signal.max_contracts = fill_qty
+        signal.total_cost = current_total
+        signal.edge_net = current_edge
+
+    except Exception as e:
+        result["error"] = f"Pre-check failed: {e}"
+        logger.warning(f"  ARB ABORTED {signal.ticker}: orderbook re-check failed: {e}")
+        return result
+
+    # Live execution: place both orders as taker (post_only=False) for immediate fill
     try:
         # Buy YES side
         yes_resp = client.place_order(
@@ -291,9 +353,10 @@ def execute_arb(
             count=signal.max_contracts,
             type="limit",
             yes_price=int(signal.yes_ask),
+            post_only=False,  # Taker: fill immediately
         )
         result["yes_order_id"] = yes_resp.get("order", {}).get("order_id", "")
-        logger.info(f"  YES order placed: {signal.ticker} x{signal.max_contracts} @ {signal.yes_ask:.0f}c")
+        logger.info(f"  YES order filled: {signal.ticker} x{signal.max_contracts} @ {signal.yes_ask:.0f}c")
     except Exception as e:
         result["error"] = f"YES order failed: {e}"
         logger.error(f"  YES order failed for {signal.ticker}: {e}")
@@ -308,10 +371,11 @@ def execute_arb(
             count=signal.max_contracts,
             type="limit",
             no_price=int(signal.no_ask),
+            post_only=False,  # Taker: fill immediately
         )
         result["no_order_id"] = no_resp.get("order", {}).get("order_id", "")
         result["executed"] = True
-        logger.info(f"  NO order placed: {signal.ticker} x{signal.max_contracts} @ {signal.no_ask:.0f}c")
+        logger.info(f"  NO order filled: {signal.ticker} x{signal.max_contracts} @ {signal.no_ask:.0f}c")
     except Exception as e:
         result["error"] = f"NO order failed (YES already placed!): {e}"
         logger.error(f"  NO order failed for {signal.ticker}: {e}")
@@ -445,6 +509,16 @@ def run_continuous(dry_run: bool = True):
     """Run continuous arb scanning loop."""
     logger = setup_logger(dry_run=dry_run)
 
+    # Check if arb strategy is enabled via config
+    if not getattr(config, "ARB_STRATEGY_ENABLED", False):
+        logger.info("=" * 60)
+        logger.info("ARB RUNNER: DISABLED via config.ARB_STRATEGY_ENABLED=False")
+        logger.info("Reason: 0 true arbs found in 5,500+ scan cycles.")
+        logger.info("Kalshi spreads are too wide: ask(YES)+ask(NO) >= 100c after fees.")
+        logger.info("Set ARB_STRATEGY_ENABLED=True in config.py to re-enable.")
+        logger.info("=" * 60)
+        return
+
     logger.info("=" * 60)
     logger.info("ARB RUNNER: Continuous YES/NO Arbitrage Scanner")
     logger.info(f"Scan interval: {SCAN_INTERVAL_SECONDS}s")
@@ -512,7 +586,11 @@ def find_orderbook_arbs(client: KalshiClient) -> list[dict]:
     """
     One-shot arb scan for integration with auto_trade.py.
     Returns list of dicts with arb details.
+    Returns empty list if ARB_STRATEGY_ENABLED is False.
     """
+    if not getattr(config, "ARB_STRATEGY_ENABLED", False):
+        return []
+
     try:
         logger = logging.getLogger("arb_runner")
         if not logger.handlers:

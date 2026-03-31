@@ -41,24 +41,24 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # =============================================================================
-# RISK MANAGEMENT — SAFE DEFAULTS FOR $100 ACCOUNT
+# RISK MANAGEMENT — TUNED FOR $580 ACCOUNT (updated 2026-03-28)
 # =============================================================================
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "580"))
 
 # Maximum percentage of account per single trade (5% = $29 on $580)
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.05"))
 
-# Maximum dollar amount per single trade
-MAX_BET_DOLLARS = float(os.getenv("MAX_BET_DOLLARS", "15"))
+# Maximum dollar amount per single trade ($25 = ~4.3% of $580)
+MAX_BET_DOLLARS = float(os.getenv("MAX_BET_DOLLARS", "25"))
 
-# Daily loss cap as percentage of account (15% = $8 on $54)
-MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.15"))
+# Daily loss cap as percentage of account (8% = $46.40 on $580)
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.08"))
 
 # Fractional Kelly criterion multiplier (0.50 = half Kelly, moderate)
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.50"))
 
 # Maximum number of open positions at once
-MAX_OPEN_POSITIONS = 15
+MAX_OPEN_POSITIONS = 20
 
 # Minimum edge required to place a trade (estimated_prob - market_price)
 MIN_EDGE_THRESHOLD = 0.05  # 5 cents minimum edge
@@ -67,23 +67,55 @@ MIN_EDGE_THRESHOLD = 0.05  # 5 cents minimum edge
 # MARKET FILTERS — High-volume, fast-settling markets only
 # =============================================================================
 TARGET_MARKET_SERIES = [
+    # --- WEATHER (proven profitable, keep active) ---
     "KXHIGHNY",     # NYC daily high temp (settles daily, high volume)
     "KXHIGHCHI",    # Chicago daily high temp (settles daily, high volume)
     "KXHIGHLA",     # LA daily high temp
     "KXHIGHMIA",    # Miami daily high temp
     "KXHIGHDC",     # Washington DC daily high temp
     "KXHIGHDEN",    # Denver daily high temp
-    "KXNBA",         # NBA (high volume)
-    "KXNHL",         # NHL (very high volume)
-    "KXMLB",         # MLB (high volume)
-    "KXNCAAB",       # NCAA Basketball
-    "KXBTC",         # Bitcoin daily range
-    "KXETH",         # Ethereum daily range
-    "KXSOL",         # Solana daily range
-    "KXNBAGAME",     # NBA individual games
-    # "KXNBAPTS",    # DISABLED: NBA player props — no model, 27% win rate, -$18 leak
-    "KXMARMAD",      # March Madness
+
+    # --- NBA (only KXNBAGAME for underdog strategy) ---
+    "KXNBAGAME",     # NBA individual games — underdog YES strategy only (+129% ROI)
+
+    # --- DISABLED LOSING STRATEGIES (2026-03-28 kill switch) ---
+    # "KXNBA",       # DISABLED: NBA Extreme NO — -$38.75, -86% ROI, 20% WR. Do not re-enable.
+    # "KXNHL",       # DISABLED: No proven edge, removed to reduce noise.
+    # "KXMLB",       # DISABLED: No proven edge, removed to reduce noise.
+    # "KXNCAAB",     # DISABLED: No proven edge, removed to reduce noise.
+    # "KXBTC",       # DISABLED: Crypto directional — -$6.95, -70% ROI, 15% WR. No real-time price feeds.
+    # "KXETH",       # DISABLED: Crypto directional — same as BTC, no edge without live data.
+    # "KXSOL",       # DISABLED: Crypto directional — same as BTC, no edge without live data.
+    # "KXNBAPTS",    # DISABLED: NBA player props — -$18.96, -68% ROI. No player data = no edge.
+    # "KXMARMAD",    # DISABLED: March Madness — season over, no proven edge.
 ]
+
+# Series explicitly BLOCKED from all trading paths (arb, autoresearch, deep ITM, etc.)
+# These will be filtered out even if they appear in broad market scans.
+# --- PERMANENT KILL LIST (2026-03-28) ---
+BLOCKED_SERIES = {
+    "KXNBAPTS",      # NBA player props — -$18.96, -68% ROI. No player data = no edge.
+    "KXNBA",         # NBA Extreme NO — -$38.75, -86% ROI, 20% WR. Pennies in front of steamrollers.
+    "KXBTC",         # Crypto directional — -$6.95, -70% ROI, 15% WR. No real-time price feeds.
+    "KXETH",         # Crypto directional — no edge without live price data.
+    "KXSOL",         # Crypto directional — no edge without live price data.
+    "KXNHL",         # No proven edge. Removed to reduce noise and avoid leaking capital.
+    "KXMLB",         # No proven edge. Removed to reduce noise and avoid leaking capital.
+    "KXNCAAB",       # No proven edge. Removed to reduce noise and avoid leaking capital.
+    "KXMARMAD",      # No proven edge. Season over.
+}
+
+# =============================================================================
+# ARB STRATEGY — DISABLED BY DEFAULT (2026-03-28)
+# =============================================================================
+# The YES/NO arb strategy found 0 true arbs in 5,500+ scan cycles.
+# Kalshi spreads are too wide for risk-free arb: best_ask(YES) + best_ask(NO)
+# is almost always >= 100c after fees. When the scanner DID signal, it was
+# using stale mid/last prices, not actual ask prices. This caused one-sided
+# fills that created unintended directional exposure instead of risk-free arb.
+#
+# Set to True to re-enable if Kalshi liquidity improves significantly.
+ARB_STRATEGY_ENABLED = False
 
 # Only trade markets with volume above this threshold
 MIN_MARKET_VOLUME = 50

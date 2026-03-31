@@ -318,49 +318,14 @@ def cmd_status():
 
 
 def cmd_pnl():
-    """All-time P&L breakdown."""
+    """All-time P&L from Kalshi API (source of truth)."""
     try:
-        if not TRADE_HISTORY.exists():
-            return "No trade history yet."
-        with open(TRADE_HISTORY) as f:
-            records = list(csv.DictReader(f))
-        settled = [r for r in records if r.get("settlement_result") in ("yes", "no")]
-        if not settled:
-            return "No settled trades yet."
-
-        total_pnl = sum(float(r.get("pnl", 0)) for r in settled)
-        wins = [r for r in settled if float(r.get("pnl", 0)) > 0]
-        losses = [r for r in settled if float(r.get("pnl", 0)) < 0]
-        win_rate = len(wins) / len(settled) * 100 if settled else 0
-
-        # By strategy
-        strats = {}
-        for r in settled:
-            tag = _classify_strategy(
-                r.get("ticker", ""), r.get("strategy", ""), r.get("side", "")
-            )
-            if tag not in strats:
-                strats[tag] = {"pnl": 0, "trades": 0, "wins": 0}
-            strats[tag]["pnl"] += float(r.get("pnl", 0))
-            strats[tag]["trades"] += 1
-            if float(r.get("pnl", 0)) > 0:
-                strats[tag]["wins"] += 1
-
-        sign = "+" if total_pnl >= 0 else ""
-        msg = (
-            f"<b>P&amp;L REPORT</b>\n\n"
-            f"Total: <b>{sign}${total_pnl:.2f}</b>\n"
-            f"Win rate: {win_rate:.0f}% ({len(wins)}W/{len(losses)}L)\n"
-            f"Settled: {len(settled)} trades\n\n"
-        )
-        for tag, d in sorted(strats.items(), key=lambda x: x[1]["pnl"], reverse=True):
-            p = d["pnl"]
-            s = "+" if p >= 0 else ""
-            wr = d["wins"] / d["trades"] * 100 if d["trades"] > 0 else 0
-            msg += f"  {tag:15s} {s}${p:.2f}  ({d['trades']}t, {wr:.0f}%)\n"
-        return msg
+        from pnl_reconciliation import reconcile, format_pnl_report
+        snapshot = reconcile(compute_fills=True)
+        return format_pnl_report(snapshot)
     except Exception as e:
-        return f"Error: {e}"
+        log.error(f"cmd_pnl error: {e}")
+        return f"P&L reconciliation error: {e}"
 
 
 def cmd_pause():

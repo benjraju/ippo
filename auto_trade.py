@@ -54,6 +54,11 @@ from weather_strategy import (
     calc_above_probability,
     calc_below_probability,
     parse_market_type,
+    apply_bias_correction,
+    get_city_stdev,
+    get_city_min_edge,
+    CITY_FORECAST_BIAS,
+    CITY_STDEV_MULTIPLIER,
 )
 
 try:
@@ -73,6 +78,11 @@ try:
     from weather_tail_strategy import find_weather_tail_trades, tail_risk_budget
 except ImportError:
     find_weather_tail_trades = None
+
+try:
+    from settlement_timing_strategy import find_settlement_timing_trades
+except ImportError:
+    find_settlement_timing_trades = None
 
 try:
     from nba_underdog_strategy import find_nba_underdogs, nba_risk_budget
@@ -123,7 +133,7 @@ ENSEMBLE_WEIGHT = 0.60
 # Trading limits
 WEATHER_EDGE_THRESHOLD_CENTS = 3.0
 BTC_EDGE_THRESHOLD_CENTS = 4.0
-MAX_DOLLARS_PER_TRADE = 15.0
+MAX_DOLLARS_PER_TRADE = 25.0
 MAX_DAILY_DEPLOY_PCT = 0.50      # 50% of account for weather
 MAX_SPORTS_TRADES_PER_DAY = 15
 SPORTS_EDGE_THRESHOLD_CENTS = 5.0
@@ -291,8 +301,8 @@ def load_strategy_params():
             "tail_fade_max_price": 5,
             "tail_fade_min_volume": 0,
             "tail_fade_weather_enabled": 1,
-            "tail_fade_crypto_enabled": 1,
-            "tail_fade_nba_enabled": 1,
+            "tail_fade_crypto_enabled": 0,  # DISABLED 2026-03-28: Crypto — -70% ROI. Do not re-enable.
+            "tail_fade_nba_enabled": 0,     # DISABLED 2026-03-28: NBA Extreme NO — -86% ROI. Do not re-enable.
             "tail_fade_mid_low": 30,
             "tail_fade_mid_high": 50,
         }
@@ -466,15 +476,23 @@ def blend_forecasts(
     nws: dict, ensemble: dict, logger: logging.Logger,
     hrrr: dict | None = None,
     strategy: dict | None = None,
+    city: str = "",
 ) -> dict:
     """
     Blend NWS official + GFS ensemble + HRRR for each date.
     Returns {date_str: {"temp": blended_temp, "stdev": ensemble_stdev, "source": str}}.
 
     Blend weights vary by days_out (see BLEND_WEIGHTS):
-      Day 0: 40% HRRR + 30% GFS + 30% NWS
+      Day 0: 50% HRRR + 25% GFS + 25% NWS  (HRRR is highest resolution for same-day)
       Day 1: 25% HRRR + 40% GFS + 35% NWS
       Day 2+: 0% HRRR + 60% GFS + 40% NWS
+
+    Per-city bias correction is applied AFTER blending. This removes systematic
+    forecast errors (e.g., Denver runs hot by ~4.7F, Miami by ~2.8F).
+
+    Per-city stdev scaling is applied to the ensemble stdev. Cities with high
+    historical forecast variance (Chicago) get wider bands; well-calibrated
+    cities (NYC) get tighter bands.
 
     If HRRR is unavailable, falls back to GFS+NWS blend with legacy weights.
     Stdev: use ensemble stdev (data-driven, not hardcoded).
@@ -509,13 +527,20 @@ def blend_forecasts(
 
         # Determine stdev (prefer ensemble-derived, fall back to evolved strategy values)
         if ens_data is not None:
-            stdev = ens_data["stdev"]
+            base_stdev = ens_data["stdev"]
         else:
-            stdev = fallback_stdev.get(min(days_out, 3), 4.0)
+            base_stdev = fallback_stdev.get(min(days_out, 3), 4.0)
+
+        # Apply per-city stdev scaling (wider for volatile cities, tighter for calibrated ones)
+        stdev = get_city_stdev(base_stdev, city) if city else base_stdev
 
         # Use HRRR-aware blending when we have HRRR data for day 0 or 1
         if hrrr_data is not None and days_out <= 1:
-            weights = blend_wts.get(days_out, blend_wts.get(2, BLEND_WEIGHTS[2]))
+            # For same-day (day 0), increase HRRR weight since it's the highest-resolution model
+            if days_out == 0:
+                weights = {"hrrr": 0.50, "gfs": 0.25, "nws": 0.25}
+            else:
+                weights = blend_wts.get(days_out, blend_wts.get(2, BLEND_WEIGHTS[2]))
             sources = []
             weighted_sum = 0.0
             total_weight = 0.0
@@ -558,6 +583,18 @@ def blend_forecasts(
             source = "gfs-only"
         else:
             continue
+
+        # Apply per-city bias correction AFTER blending
+        # This removes systematic forecast errors (Denver +4.7F, Miami +2.8F)
+        if city:
+            raw_blended = blended
+            blended = apply_bias_correction(blended, city)
+            bias = CITY_FORECAST_BIAS.get(city, 0.0)
+            if abs(bias) > 0.1:
+                logger.debug(
+                    f"  Bias correction {city} {date_str}: "
+                    f"{raw_blended:.1f}F -> {blended:.1f}F (bias={bias:+.1f}F)"
+                )
 
         result[date_str] = {"temp": blended, "stdev": stdev, "source": source}
 
@@ -648,10 +685,25 @@ def run_arb_session(
 ) -> list[TradeDecision]:
     """
     Arbitrage scanning session.
-    Scans for YES/NO mispricing and cross-event arb, places both sides when found.
+
+    Scans for YES/NO mispricing using ACTUAL orderbook ask prices.
+    Only signals when ask(YES) + ask(NO) < 100c after fees, meaning
+    both sides can be bought immediately for a guaranteed profit.
+
+    DISABLED by default (config.ARB_STRATEGY_ENABLED) because Kalshi
+    spreads are too wide: 0 true arbs found in 5,500+ scan cycles.
     """
     logger.info("--- ARB SESSION START ---")
     decisions = []
+
+    # Check kill switch
+    if not getattr(config, "ARB_STRATEGY_ENABLED", False):
+        logger.info(
+            "Arb strategy DISABLED (config.ARB_STRATEGY_ENABLED=False). "
+            "0 true arbs found in 5,500+ scans; Kalshi spreads too wide."
+        )
+        logger.info("--- ARB SESSION DONE: 0 decisions, 0 trades (disabled) ---")
+        return decisions
 
     # Load evolved strategy parameters from candidate_strategy.py
     strategy = load_strategy_params()
@@ -666,11 +718,9 @@ def run_arb_session(
     # Track remaining cash balance to avoid 400 errors from insufficient funds
     remaining_balance = balance
 
-    # Only arb on series where we have proven edges or true risk-free arb
+    # Only arb on weather series (other series removed for poor performance)
     ARB_ALLOWED_SERIES = {
         "KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHDEN", "KXHIGHDC", "KXHIGHLA",
-        # KXNBAGAME removed -- NBA games handled exclusively by underdog session
-        "KXBTC", "KXETH", "KXSOL",
     }
 
     if ArbScanner is None:
@@ -678,7 +728,7 @@ def run_arb_session(
         logger.info("--- ARB SESSION DONE: 0 decisions, 0 trades ---")
         return decisions
 
-    # 1. Scan for arb opportunities
+    # 1. Scan for arb opportunities (now uses orderbook asks, not mid prices)
     try:
         scanner = MarketScanner(client)
         arb = ArbScanner(client)
@@ -704,7 +754,7 @@ def run_arb_session(
             logger.info(f"Arb trade cap reached ({MAX_ARB_TRADES_PER_DAY})")
             break
 
-        # Capital cap check: stop placing arb trades once we've deployed enough
+        # Capital cap check
         if arb_capital_deployed >= arb_capital_cap:
             logger.info(f"Arb capital cap reached: ${arb_capital_deployed:.2f} >= ${arb_capital_cap:.2f}")
             break
@@ -714,7 +764,13 @@ def run_arb_session(
         if opp_series and opp_series not in ARB_ALLOWED_SERIES:
             continue
 
-        # Skip NBA game winners -- these should ONLY be traded by the NBA underdog session
+        # Explicit blocklist check
+        blocked = getattr(config, "BLOCKED_SERIES", set())
+        if opp_series and opp_series in blocked:
+            logger.debug(f"  SKIP ARB {opp.ticker}: series {opp_series} is in BLOCKED_SERIES")
+            continue
+
+        # Skip NBA game winners
         if hasattr(opp, "ticker") and opp.ticker.startswith("KXNBAGAME"):
             logger.debug(f"  SKIP ARB {opp.ticker}: NBA games handled by underdog session only")
             continue
@@ -726,35 +782,37 @@ def run_arb_session(
             logger.debug(f"  SKIP ARB {opp.ticker}: low confidence {opp.confidence:.0%}")
             continue
 
-        # For yes_no_arb: buy BOTH yes and no to lock in guaranteed profit
+        # For yes_no_arb: buy BOTH sides using ACTUAL ask prices from orderbook
         if opp.type == "yes_no_arb":
             yes_price = opp.details.get("yes_price", 0)
             no_price = opp.details.get("no_price", 0)
+            yes_depth = opp.details.get("yes_depth", 0)
+            no_depth = opp.details.get("no_depth", 0)
             total_cost_cents = yes_price + no_price
-            cost_per_pair = total_cost_cents / 100.0  # dollars per pair
+            total_fees = opp.details.get("fees", 0)
+            cost_per_pair = total_cost_cents / 100.0
 
-            # Fee calculation: Kalshi charges ~1.75% * price * (1-price) per side
-            # For a YES+NO arb we pay fees on BOTH sides
-            MAKER_FEE_RATE = 0.0175
-            yes_fee_cents = MAKER_FEE_RATE * yes_price * (100 - yes_price) / 100.0
-            no_fee_cents = MAKER_FEE_RATE * no_price * (100 - no_price) / 100.0
-            total_fee_cents = yes_fee_cents + no_fee_cents
-            profit_after_fees_cents = (100 - total_cost_cents) - total_fee_cents
+            # edge_cents from the scanner already accounts for maker fees
+            profit_after_fees_cents = opp.edge_cents
 
             if profit_after_fees_cents <= 1.0:
                 logger.debug(
-                    f"  SKIP ARB {opp.ticker}: profit after fees {profit_after_fees_cents:.2f}c <= 1c "
-                    f"(gross edge {100 - total_cost_cents}c, fees {total_fee_cents:.2f}c)"
+                    f"  SKIP ARB {opp.ticker}: net edge {profit_after_fees_cents:.2f}c <= 1c"
                 )
                 continue
 
-            # Size: enough pairs to deploy up to $1, capped by daily loss cap AND arb capital cap
+            # Size: capped by orderbook depth, budget, and arb capital cap
             remaining_arb_cap = arb_capital_cap - arb_capital_deployed
             max_dollars = min(1.0, daily_loss_cap, remaining_arb_cap)
             if max_dollars <= 0:
                 logger.info(f"  SKIP ARB {opp.ticker}: arb capital cap exhausted")
                 break
-            pairs = max(1, int(max_dollars / cost_per_pair)) if cost_per_pair > 0 else 0
+            max_by_budget = max(1, int(max_dollars / cost_per_pair)) if cost_per_pair > 0 else 0
+            # Cap by orderbook depth on both sides
+            pairs = min(max_by_budget, yes_depth, no_depth) if yes_depth > 0 and no_depth > 0 else 0
+            if pairs < 1:
+                logger.debug(f"  SKIP ARB {opp.ticker}: insufficient depth YES={yes_depth} NO={no_depth}")
+                continue
             actual_cost = pairs * cost_per_pair
 
             # Create decision for YES side
@@ -762,13 +820,13 @@ def run_arb_session(
                 ticker=opp.ticker,
                 action="buy_yes",
                 strategy="arb",
-                edge_cents=round(opp.edge_cents / 2, 1),  # Half edge per side
-                fair_value_cents=round(50.0, 1),  # Guaranteed $1 payout
+                edge_cents=round(opp.edge_cents / 2, 1),
+                fair_value_cents=round(50.0, 1),
                 market_price_cents=int(yes_price),
                 price_to_pay_cents=int(yes_price),
                 contracts=pairs,
                 max_loss_dollars=round(pairs * yes_price / 100.0, 2),
-                reason=f"ARB: {opp.description} | confidence={opp.confidence:.0%}",
+                reason=f"ARB (ask-verified): {opp.description} | confidence={opp.confidence:.0%}",
             )
 
             # Create decision for NO side
@@ -782,13 +840,13 @@ def run_arb_session(
                 price_to_pay_cents=int(no_price),
                 contracts=pairs,
                 max_loss_dollars=round(pairs * no_price / 100.0, 2),
-                reason=f"ARB: {opp.description} | confidence={opp.confidence:.0%}",
+                reason=f"ARB (ask-verified): {opp.description} | confidence={opp.confidence:.0%}",
             )
 
             if alert_big_edge and opp.edge_cents > 10:
                 alert_big_edge(opp.ticker, opp.edge_cents, "ARB")
 
-            # Pre-flight balance check (local tracking, no API call)
+            # Pre-flight balance check
             if actual_cost > remaining_balance:
                 decision_yes.reason += " | SKIP: insufficient balance"
                 decision_yes.contracts = 0
@@ -800,7 +858,9 @@ def run_arb_session(
                 )
                 continue
 
-            # Place both sides
+            # Place both sides as taker orders (post_only=False) for immediate fill.
+            # Using maker orders (post_only=True) caused one-sided fills and
+            # unintended directional exposure -- the opposite of a risk-free arb.
             if not dry_run and pairs > 0:
                 order_succeeded = True
                 for dec, side, price_c in [
@@ -808,7 +868,6 @@ def run_arb_session(
                     (decision_no, "no", int(no_price)),
                 ]:
                     side_cost = pairs * price_c / 100.0
-                    # Check remaining balance before each individual order
                     if side_cost > remaining_balance:
                         dec.error = f"insufficient balance (${remaining_balance:.2f} < ${side_cost:.2f})"
                         logger.warning(
@@ -824,6 +883,7 @@ def run_arb_session(
                             "action": "buy",
                             "count": pairs,
                             "type": "limit",
+                            "post_only": False,  # Taker: fill immediately at ask
                         }
                         if side == "yes":
                             order_kwargs["yes_price"] = price_c
@@ -837,13 +897,41 @@ def run_arb_session(
                         remaining_balance -= side_cost
                         logger.info(
                             f"  ARB ORDER: {side.upper()} {opp.ticker} x{pairs} "
-                            f"@ {price_c}c | profit_after_fees +{profit_after_fees_cents:.1f}c "
+                            f"@ {price_c}c (taker fill) | net_edge +{profit_after_fees_cents:.1f}c "
                             f"| order_id={order_id} | remaining=${remaining_balance:.2f}"
                         )
                     except Exception as e:
                         dec.error = str(e)
                         logger.error(f"  ARB ORDER FAILED: {side} {opp.ticker} -- {e}")
                         order_succeeded = False
+
+                        # If YES filled but NO failed, cancel YES to avoid directional exposure
+                        if side == "no" and decision_yes.placed:
+                            yes_oid = decision_yes.order_id
+                            try:
+                                client.cancel_order(yes_oid)
+                                logger.warning(
+                                    f"  Cancelled YES order {yes_oid} for {opp.ticker} "
+                                    f"after NO side failed"
+                                )
+                                decision_yes.error += f" | cancelled after NO failed"
+                            except Exception as cancel_err:
+                                logger.critical(
+                                    f"  FAILED TO CANCEL YES ORDER {yes_oid} for {opp.ticker}: "
+                                    f"{cancel_err} -- MANUAL INTERVENTION REQUIRED"
+                                )
+                                if alert_bot_error:
+                                    alert_bot_error(
+                                        "auto_trade",
+                                        f"CANCEL FAILED: YES order {yes_oid} on {opp.ticker}. "
+                                        f"NO failed: {e} | Cancel error: {cancel_err}",
+                                    )
+                            if alert_bot_error:
+                                alert_bot_error(
+                                    "auto_trade",
+                                    f"HALF-FILLED ARB: {opp.ticker} - NO failed: {e}",
+                                )
+
                 if order_succeeded:
                     arb_capital_deployed += actual_cost
                 trades_placed += 1
@@ -855,7 +943,7 @@ def run_arb_session(
                     logger.info(
                         f"  DRY-RUN ARB: would buy BOTH sides {opp.ticker} x{pairs} "
                         f"(YES@{yes_price}c + NO@{no_price}c = {total_cost_cents}c) "
-                        f"| profit_after_fees +{profit_after_fees_cents:.1f}c "
+                        f"| net_edge +{profit_after_fees_cents:.1f}c "
                         f"| arb_deployed=${arb_capital_deployed:.2f}/{arb_capital_cap:.2f}"
                     )
 
@@ -897,6 +985,103 @@ def run_arb_session(
 # ---------------------------------------------------------------------------
 
 EXIT_EDGE_THRESHOLD_CENTS = 2.0  # Exit when edge drops below this
+
+
+# ---------------------------------------------------------------------------
+# Stale order cleanup
+# ---------------------------------------------------------------------------
+
+def cleanup_stale_orders(
+    client: KalshiClient,
+    logger: logging.Logger,
+    max_age_hours: float = 3.0,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Cancel resting orders older than max_age_hours.
+
+    Stale limit orders tie up capital at prices that no longer reflect
+    current forecasts.  Running this at the START of each trading cycle
+    frees that capital for fresh orders with up-to-date edge estimates.
+
+    Returns {"cancelled": int, "capital_freed_dollars": float, "errors": int}.
+    """
+    result = {"cancelled": 0, "capital_freed_dollars": 0.0, "errors": 0}
+
+    try:
+        resp = client.get_orders(status="resting")
+        orders = resp.get("orders", [])
+    except Exception as e:
+        logger.warning(f"Stale order cleanup: failed to fetch resting orders: {e}")
+        return result
+
+    if not orders:
+        logger.debug("Stale order cleanup: no resting orders")
+        return result
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=max_age_hours)
+
+    for order in orders:
+        order_id = order.get("order_id", "")
+        ticker = order.get("ticker", "unknown")
+        created_str = order.get("created_time", "")
+
+        if not created_str or not order_id:
+            continue
+
+        # Parse ISO 8601 timestamp (Kalshi uses e.g. "2026-03-28T14:30:00Z")
+        try:
+            # Handle both "Z" suffix and "+00:00" suffix
+            created_str_clean = created_str.replace("Z", "+00:00")
+            created_time = datetime.fromisoformat(created_str_clean)
+        except (ValueError, TypeError):
+            logger.debug(f"Stale order cleanup: unparseable created_time '{created_str}' for {ticker}")
+            continue
+
+        age = now - created_time
+        age_hours = age.total_seconds() / 3600.0
+
+        if age_hours < max_age_hours:
+            continue
+
+        # Calculate capital tied up in this order
+        remaining = order.get("remaining_count", 0)
+        # Kalshi orders have yes_price or no_price in cents
+        price_cents = order.get("yes_price", 0) or order.get("no_price", 0)
+        capital_tied = remaining * price_cents / 100.0
+
+        if dry_run:
+            logger.info(
+                f"  [DRY] CANCEL STALE: {ticker} | order={order_id[:8]}... | "
+                f"age={age_hours:.1f}h | {remaining} contracts @ {price_cents}c | "
+                f"frees ${capital_tied:.2f}"
+            )
+            result["cancelled"] += 1
+            result["capital_freed_dollars"] += capital_tied
+            continue
+
+        try:
+            client.cancel_order(order_id)
+            result["cancelled"] += 1
+            result["capital_freed_dollars"] += capital_tied
+            logger.info(
+                f"  CANCELLED STALE: {ticker} | order={order_id[:8]}... | "
+                f"age={age_hours:.1f}h | {remaining} contracts @ {price_cents}c | "
+                f"freed ${capital_tied:.2f}"
+            )
+        except Exception as e:
+            result["errors"] += 1
+            logger.warning(f"  Failed to cancel stale order {order_id[:8]}... on {ticker}: {e}")
+
+    if result["cancelled"] > 0 or result["errors"] > 0:
+        logger.info(
+            f"Stale order cleanup: cancelled {result['cancelled']} orders, "
+            f"freed ${result['capital_freed_dollars']:.2f}, "
+            f"{result['errors']} errors"
+        )
+
+    return result
 
 
 def check_exits(
@@ -1072,8 +1257,24 @@ def check_exits(
         else:
             # Place a sell order to close the position
             try:
-                sell_price = int(yes_bid) if our_side == "yes" else int(100 - yes_ask)
-                sell_price = max(1, min(99, sell_price))
+                # Sell 1c ABOVE the current bid to stay as maker (avoid "post only cross").
+                # Selling AT the bid crosses immediately and gets rejected by post_only.
+                if our_side == "yes":
+                    raw_sell = int(yes_bid)
+                    sell_price = min(99, max(1, raw_sell + 1))
+                else:
+                    raw_sell = int(100 - yes_ask)
+                    sell_price = min(99, max(1, raw_sell + 1))
+
+                # Skip if the book is too thin to exit safely as maker.
+                # Near-settlement markets often have bid=0/ask=1 leaving no room
+                # for a maker sell. Let these settle automatically.
+                if raw_sell >= 98 or raw_sell <= 1:
+                    logger.debug(
+                        f"  EXIT SKIP (thin book): {ticker} -- "
+                        f"raw_sell={raw_sell}c, letting it settle"
+                    )
+                    continue
 
                 order_kwargs = {
                     "ticker": ticker,
@@ -1195,10 +1396,14 @@ def run_dutch_book_session(
 
             for leg in legs:
                 ticker = leg["ticker"]
-                sell_price = leg["yes_bid"]
-                if sell_price < 1:
+                bid_price = leg["yes_bid"]
+                if bid_price < 1:
                     all_placed = False
                     continue
+
+                # For SELL YES, post 1c ABOVE the current bid to stay as maker.
+                # Selling at bid price crosses immediately (taker), causing "post only cross".
+                maker_sell_price = min(99, bid_price + 1)
 
                 decision = TradeDecision(
                     ticker=ticker,
@@ -1206,13 +1411,13 @@ def run_dutch_book_session(
                     strategy="dutch_book",
                     edge_cents=round(profit_cents / len(legs), 1),
                     fair_value_cents=round(100 / len(legs), 1),
-                    market_price_cents=sell_price,
-                    price_to_pay_cents=sell_price,
+                    market_price_cents=bid_price,
+                    price_to_pay_cents=maker_sell_price,
                     contracts=1,
-                    max_loss_dollars=round((100 - sell_price) / 100.0, 2),
+                    max_loss_dollars=round((100 - maker_sell_price) / 100.0, 2),
                     reason=(
                         f"DUTCH BOOK: {event_ticker} leg | "
-                        f"sell YES@{sell_price}c | total_profit={profit_cents:.0f}c"
+                        f"sell YES@{maker_sell_price}c (bid={bid_price}c) | total_profit={profit_cents:.0f}c"
                     ),
                 )
 
@@ -1224,7 +1429,7 @@ def run_dutch_book_session(
                             action="sell",
                             count=1,
                             type="limit",
-                            yes_price=sell_price,
+                            yes_price=maker_sell_price,
                             post_only=True,
                         )
                         order_id = result.get("order", {}).get("order_id", "unknown")
@@ -1232,7 +1437,7 @@ def run_dutch_book_session(
                         decision.order_id = order_id
                         logger.info(
                             f"    DUTCH BOOK ORDER: SELL YES {ticker} x1 "
-                            f"@ {sell_price}c | order_id={order_id}"
+                            f"@ {maker_sell_price}c | order_id={order_id}"
                         )
                     except Exception as e:
                         decision.error = str(e)
@@ -1240,7 +1445,7 @@ def run_dutch_book_session(
                         logger.error(f"    DUTCH BOOK ORDER FAILED: {ticker} -- {e}")
                 else:
                     logger.info(
-                        f"    DRY-RUN DUTCH BOOK: would SELL YES {ticker} x1 @ {sell_price}c"
+                        f"    DRY-RUN DUTCH BOOK: would SELL YES {ticker} x1 @ {maker_sell_price}c"
                     )
 
                 event_decisions.append(decision)
@@ -1286,18 +1491,9 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             alert_bot_error("auto_trade", str(e))
         return
 
-    # Clean up stale resting orders from previous sessions
+    # Cancel resting orders older than 3 hours -- frees capital from stale prices
     try:
-        stale_orders = client._request("GET", "/portfolio/orders", params={"status": "resting", "limit": 200})
-        stale = [o for o in stale_orders.get("orders", []) if o.get("remaining_count", 0) == 0]
-        if stale:
-            for o in stale:
-                try:
-                    client._request("DELETE", f"/portfolio/orders/{o['order_id']}")
-                except Exception:
-                    pass
-                time.sleep(0.1)
-            logger.info(f"Cleaned up {len(stale)} stale resting orders")
+        stale_result = cleanup_stale_orders(client, logger, max_age_hours=3.0, dry_run=dry_run)
     except Exception as e:
         logger.warning(f"Stale order cleanup failed: {e}")
 
@@ -1334,7 +1530,7 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
     # --- NBA Underdog session (focused, proven edge) ---
     # Buys YES on KXNBAGAME underdogs priced 10-30c.
     # Historical: 29.7% win rate vs 22% implied = +7.7pp edge, ROI +33%, Sharpe 2.64.
-    # Conservative sizing: quarter Kelly, max $2/trade, max 5 bets/day.
+    # Conservative sizing: quarter Kelly, max $6/trade, max 5 bets/day.
     if find_nba_underdogs is not None:
         try:
             underdogs = find_nba_underdogs(client)
@@ -1368,7 +1564,9 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                     continue
                 price_cents = int(ud.get("yes_price_cents", 20))
                 cost_per = price_cents / 100.0
-                max_contracts = int(budget.get("max_bet_dollars", 2.0) / cost_per) if cost_per > 0 else 0
+                max_contracts = int(budget.get("max_bet_dollars", 6.0) / cost_per) if cost_per > 0 else 0
+                # Use suggested_contracts from strategy (quarter Kelly sized) as starting point,
+                # then cap by budget limit
                 contracts = max(1, min(ud.get("suggested_contracts", 1), max_contracts))
                 if contracts <= 0:
                     continue
@@ -1455,13 +1653,58 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         try:
             tail_trades = find_weather_tail_trades(client)
             risk = tail_risk_budget(balance)
+
+            # Get existing positions to prevent accumulation
+            MAX_TAIL_CONTRACTS_PER_TICKER = 8
+            existing_positions = {}
+            try:
+                pos_data = client.get_positions()
+                for mp in pos_data.get("market_positions", []):
+                    fp = float(mp.get("position_fp", 0))
+                    if fp != 0:
+                        existing_positions[mp.get("ticker", "")] = int(abs(fp))
+            except Exception:
+                pass
+
             for tt in tail_trades[:5]:  # max 5 tail trades per cycle
-                # Use risk budget for contract count (suggested_contracts is never set by weather_tail_strategy)
-                max_contracts = min(risk.get("max_contracts", 5), 3)  # cap at 3 per the strategy design
-                price_cents = int(tt.get("no_price_cents", 97))
+                # Check accumulation cap
+                ticker = tt["ticker"]
+                current_contracts = existing_positions.get(ticker, 0)
+                if current_contracts >= MAX_TAIL_CONTRACTS_PER_TICKER:
+                    logger.debug(f"  SKIP TAIL {ticker}: already {current_contracts} contracts (max {MAX_TAIL_CONTRACTS_PER_TICKER})")
+                    continue
+                room = MAX_TAIL_CONTRACTS_PER_TICKER - current_contracts
+
+                # Use risk budget for contract count.
+                # tail_risk_budget returns max_contracts capped at 8 (safe for $580 bankroll).
+                # Scale by P(NO): near-certain tails (YES<=5c, P(NO)>0.99) get max; riskier tails get less.
+                # Also scale by dutch book signal: when sum(YES asks) > 110c, market is
+                # structurally overpriced and NO bets have extra conviction.
+                our_no_prob = tt.get("our_no_prob", 0.98)
+                budget_max = risk.get("max_contracts", 5)
+                if our_no_prob >= 0.995:
+                    max_contracts = budget_max
+                elif our_no_prob >= 0.98:
+                    max_contracts = max(1, int(budget_max * 0.75))
+                else:
+                    max_contracts = max(1, int(budget_max * 0.5))
+
+                # Dutch book sizing: scale contracts by market overpricing signal
+                db_total = tt.get("dutch_book_total", 100)
+                if db_total < 102:
+                    # Weak/no dutch book signal: reduce to 50%
+                    max_contracts = max(1, int(max_contracts * 0.5))
+                elif db_total < 110:
+                    # Moderate signal: scale linearly 50%-100%
+                    scale = 0.5 + 0.5 * (db_total - 102) / 8
+                    max_contracts = max(1, int(max_contracts * scale))
+                # else: db_total >= 110, full allocation (no change)
+                raw_no_price = int(tt.get("no_price_cents", 97))
+                # Bid 1c below the NO ask to stay as maker (avoid "post only cross")
+                price_cents = max(1, raw_no_price - 1)
                 cost_per = price_cents / 100.0
                 contracts_by_budget = int(config.MAX_BET_DOLLARS / cost_per) if cost_per > 0 else 1
-                contracts = max(1, min(contracts_by_budget, max_contracts))
+                contracts = max(1, min(contracts_by_budget, max_contracts, room))
                 if contracts <= 0:
                     continue
                 decision = TradeDecision(
@@ -1474,7 +1717,7 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                     price_to_pay_cents=price_cents,
                     contracts=contracts,
                     max_loss_dollars=contracts * price_cents / 100.0,
-                    reason=f"Weather tail: YES@{tt.get('yes_price_cents',0)}c, P(NO)={tt.get('our_no_prob',0.99):.3f}, edge={tt.get('net_edge_cents',0):.1f}c",
+                    reason=f"Weather tail: YES@{tt.get('yes_price_cents',0)}c, P(NO)={tt.get('our_no_prob',0.99):.3f}, edge={tt.get('net_edge_cents',0):.1f}c, NO@{price_cents}c (maker)",
                     placed=False,
                 )
                 if not dry_run:
@@ -1500,6 +1743,99 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
             logger.error(f"Weather tail session crashed: {e}")
             logger.error(traceback.format_exc())
 
+    # --- Settlement Timing session (buy YES/NO on known outcomes near settlement) ---
+    # Near-risk-free: uses OBSERVED temperature (not forecast) after 2 PM local.
+    if find_settlement_timing_trades is not None:
+        try:
+            logger.info("--- SETTLEMENT TIMING SESSION START ---")
+            st_trades = find_settlement_timing_trades(client)
+
+            # Get existing positions to prevent accumulation
+            MAX_SETTLEMENT_CONTRACTS_PER_TICKER = 5
+            st_existing = {}
+            try:
+                pos_data = client.get_positions()
+                for mp in pos_data.get("market_positions", []):
+                    fp = float(mp.get("position_fp", 0))
+                    if fp != 0:
+                        st_existing[mp.get("ticker", "")] = int(abs(fp))
+            except Exception:
+                pass
+
+            st_count = 0
+            for st in st_trades[:10]:  # max 10 per cycle
+                ticker = st.ticker
+                current_contracts = st_existing.get(ticker, 0)
+                if current_contracts >= MAX_SETTLEMENT_CONTRACTS_PER_TICKER:
+                    logger.debug(f"  SKIP SETTLE {ticker}: already {current_contracts} contracts")
+                    continue
+                room = MAX_SETTLEMENT_CONTRACTS_PER_TICKER - current_contracts
+
+                contracts = min(st.suggested_contracts, room)
+                if contracts <= 0:
+                    continue
+
+                if st.side == "yes":
+                    price_cents = max(1, st.yes_price_cents - 1)  # 1c below ask for maker
+                else:
+                    price_cents = max(1, st.no_price_cents - 1)
+
+                cost_per = price_cents / 100.0
+                decision = TradeDecision(
+                    ticker=ticker,
+                    action=f"buy_{st.side}",
+                    strategy="settlement_timing",
+                    edge_cents=st.expected_profit_cents,
+                    fair_value_cents=99.0,
+                    market_price_cents=st.yes_price_cents,
+                    price_to_pay_cents=price_cents,
+                    contracts=contracts,
+                    max_loss_dollars=contracts * cost_per,
+                    reason=(
+                        f"Settlement timing: {st.side.upper()}@{price_cents}c, "
+                        f"obs_high={st.observed_high_f:.1f}F, thresh={st.threshold_f:.0f}F, "
+                        f"buffer={st.buffer_f:+.1f}F, conf={st.confidence}"
+                    ),
+                    placed=False,
+                )
+                if not dry_run:
+                    try:
+                        order_kwargs = {
+                            "ticker": ticker,
+                            "side": st.side,
+                            "action": "buy",
+                            "count": contracts,
+                            "type": "limit",
+                        }
+                        if st.side == "yes":
+                            order_kwargs["yes_price"] = price_cents
+                        else:
+                            order_kwargs["no_price"] = price_cents
+                        result = client.place_order(**order_kwargs)
+                        decision.placed = True
+                        decision.order_id = result.get("order", {}).get("order_id", "")
+                        logger.info(
+                            f"SETTLEMENT: {ticker} BUY {st.side.upper()} x{contracts} "
+                            f"@{price_cents}c | obs={st.observed_high_f:.1f}F thresh={st.threshold_f:.0f}F "
+                            f"buf={st.buffer_f:+.1f}F"
+                        )
+                    except Exception as e:
+                        decision.error = str(e)
+                        logger.warning(f"Settlement timing order failed: {e}")
+                else:
+                    logger.info(
+                        f"[DRY] SETTLEMENT: {ticker} {st.side.upper()} x{contracts} "
+                        f"@{price_cents}c obs={st.observed_high_f:.1f}F thresh={st.threshold_f:.0f}F"
+                    )
+                all_decisions.append(decision)
+                st_count += 1
+            logger.info(f"--- SETTLEMENT TIMING SESSION DONE: {st_count} orders ---")
+        except Exception as e:
+            logger.error(f"Settlement timing session crashed: {e}")
+            logger.error(traceback.format_exc())
+    else:
+        logger.info("--- SETTLEMENT TIMING SESSION SKIPPED (module not found) ---")
+
     # --- Deep ITM Maker session (buy YES at 95c on near-certain markets) ---
     try:
         from deep_itm_strategy import find_deep_itm_opportunities, deep_itm_risk_budget
@@ -1511,21 +1847,22 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         for opp in itm_opps[:max_itm]:
             if itm_count >= max_itm:
                 break
-            contracts = min(opp.get("suggested_contracts", 1), itm_budget.get("max_contracts_per_position", 3))
+            # DeepITMOpportunity is a dataclass, not a dict -- use attribute access
+            contracts = min(getattr(opp, "contracts", 1), itm_budget.get("max_contracts_per_position", 3))
             if contracts <= 0:
                 continue
-            bid_price = opp.get("our_bid_cents", 95)
+            bid_price = getattr(opp, "our_bid_price", 95)
             decision = TradeDecision(
-                ticker=opp["ticker"],
+                ticker=opp.ticker,
                 action="buy_yes",
                 strategy="deep_itm",
-                edge_cents=opp.get("ev_cents", 0),
-                fair_value_cents=opp.get("win_rate", 0.996) * 100,
-                market_price_cents=opp.get("current_yes_ask_cents", 99),
+                edge_cents=getattr(opp, "ev_per_contract", 0),
+                fair_value_cents=99.6,  # 99.6% win rate
+                market_price_cents=getattr(opp, "current_yes_ask", 99),
                 price_to_pay_cents=bid_price,
                 contracts=contracts,
                 max_loss_dollars=contracts * bid_price / 100.0,
-                reason=f"Deep ITM: YES@{opp.get('current_yes_ask_cents',99)}c, bid@{bid_price}c, WR={opp.get('win_rate',0.996):.3f}, EV={opp.get('ev_cents',0):.1f}c",
+                reason=f"Deep ITM: YES@{opp.current_yes_ask}c, bid@{bid_price}c, EV={opp.ev_per_contract:.1f}c",
                 placed=False,
             )
             if not dry_run:
@@ -1543,7 +1880,7 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                     decision.order_id = result.get("order", {}).get("order_id", "")
                     logger.info(
                         f"DEEP ITM: {decision.ticker} BUY YES x{contracts} "
-                        f"@{bid_price}c EV={opp.get('ev_cents',0):.1f}c"
+                        f"@{bid_price}c EV={getattr(opp, 'ev_per_contract', 0):.1f}c"
                     )
                 except Exception as e:
                     decision.error = str(e)
@@ -1591,9 +1928,14 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
         ar_deployed = 0.0
         ar_budget = balance * 0.20  # max 20% of balance for this session
 
+        blocked = getattr(config, "BLOCKED_SERIES", set())
+
         for series_prefix in config.TARGET_MARKET_SERIES:
             if ar_count >= ar_max or ar_deployed >= ar_budget:
                 break
+            # Skip blocked series entirely
+            if series_prefix in blocked:
+                continue
             try:
                 page = client.get_markets(series_ticker=series_prefix, status="open", limit=50)
                 markets = page.get("markets", [])
@@ -1608,7 +1950,15 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                 if not ticker or ticker in already_traded:
                     continue
 
+                # Skip markets from blocked series (defense-in-depth for broad API responses)
+                ticker_series = ticker.split("-")[0] if "-" in ticker else ticker
+                if ticker_series in blocked:
+                    continue
+
                 series = mkt.get("series_ticker", "") or mkt.get("event_ticker", "").split("-")[0]
+                # Also check the API-reported series_ticker against blocklist
+                if series in blocked:
+                    continue
                 # Parse prices — API returns dollar strings like "0.3300"
                 try:
                     yes_bid = int(float(mkt.get("yes_bid_dollars", 0) or 0) * 100)
@@ -1643,19 +1993,39 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                     continue
 
                 action = signal["action"]
+
+                # Guard: block ALL NBA trades from autoresearch.
+                # NBA underdog YES is handled by the dedicated underdog session.
+                # NBA buy_NO from autoresearch is "pennies in front of steamrollers":
+                #   lost -$38.75 at -86% ROI on the first day (3 underdogs won).
+                #   Currently $37.63 deployed in NO positions that shouldn't exist.
+                # Only the dedicated NBA underdog session should trade KXNBAGAME.
+                if ticker_series.startswith("KXNBAGAME"):
+                    logger.debug(f"  SKIP AutoResearch {ticker}: NBA games handled by underdog session only")
+                    continue
+
                 # Cap contracts to real position sizes (backtest uses astronomical numbers)
                 raw_contracts = signal.get("contracts", 1)
                 if action == "buy_yes":
+                    # Bid 1c below ask to stay as maker (avoid "post only cross")
                     entry_price = yes_ask if yes_ask > 0 else yes_cents
+                    maker_price = max(1, entry_price - 1)
                 elif action == "buy_no":
-                    entry_price = 100 - (yes_bid if yes_bid > 0 else yes_cents)
+                    # Buy NO: use complement of yes_ask as the NO bid target.
+                    # 100-yes_ask = NO bid (what a YES seller implicitly offers for NO).
+                    # This is conservative and avoids crossing direct NO sells.
+                    no_bid = 100 - (yes_ask if yes_ask > 0 else yes_cents)
+                    entry_price = no_bid if no_bid > 0 else (100 - yes_cents)
+                    maker_price = max(1, min(entry_price, 99))
                 else:
                     continue
 
                 if entry_price <= 0 or entry_price >= 100:
                     continue
+                if maker_price <= 0 or maker_price >= 100:
+                    continue
 
-                cost_per = entry_price / 100.0
+                cost_per = maker_price / 100.0
                 max_by_budget = int(config.MAX_BET_DOLLARS / cost_per) if cost_per > 0 else 0
                 contracts = max(1, min(raw_contracts, max_by_budget, 10))
 
@@ -1666,7 +2036,7 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                     continue
 
                 side = "yes" if action == "buy_yes" else "no"
-                price_cents = entry_price
+                price_cents = maker_price
 
                 decision = TradeDecision(
                     ticker=ticker,
@@ -1690,6 +2060,11 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                             "action": "buy",
                             "count": contracts,
                             "type": "limit",
+                            # AutoResearch: don't use post_only because the NO orderbook
+                            # can have direct sells below our computed price, causing
+                            # post_only_cross rejections. Allow taker fills (7% fee)
+                            # rather than losing the trade entirely.
+                            "post_only": False,
                         }
                         if side == "yes":
                             order_kwargs["yes_price"] = price_cents
@@ -1785,6 +2160,7 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                 },
                 f,
                 indent=2,
+                default=lambda o: int(o) if hasattr(o, 'item') else str(o),
             )
         logger.info(f"Decisions saved to: {json_path}")
     except Exception as e:
@@ -1817,6 +2193,24 @@ def run_auto_trade(dry_run: bool = True, weather: bool = True, btc: bool = True,
                     )
                 except Exception:
                     pass
+
+    # --- Monitoring summary: order health metrics ---
+    orders_attempted = len(all_decisions)
+    orders_placed = len([d for d in all_decisions if d.placed])
+    orders_failed = len([d for d in all_decisions if d.error])
+    orders_skipped = orders_attempted - orders_placed - orders_failed
+    post_only_errors = len([d for d in all_decisions if d.error and "post only cross" in str(d.error)])
+    fill_rate = (orders_placed / orders_attempted * 100) if orders_attempted > 0 else 0
+    logger.info(
+        f"ORDER HEALTH: attempted={orders_attempted} placed={orders_placed} "
+        f"failed={orders_failed} skipped={orders_skipped} "
+        f"post_only_cross={post_only_errors} fill_rate={fill_rate:.0f}%"
+    )
+    if post_only_errors > 0:
+        logger.warning(
+            f"POST_ONLY_CROSS ALERT: {post_only_errors} orders rejected -- "
+            f"check order pricing logic (should bid 1c inside spread)"
+        )
 
     logger.info("=" * 60)
     logger.info("AUTO-TRADE SESSION COMPLETE")

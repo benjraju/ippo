@@ -77,6 +77,17 @@ class KalshiClient:
                 )
                 resp.raise_for_status()
                 return resp.json()
+            except requests.exceptions.HTTPError as e:
+                # Capture the response body so callers get actionable error info
+                # (e.g., "market is closed", "invalid price", "insufficient balance")
+                detail = ""
+                try:
+                    detail = resp.text[:500]
+                except Exception:
+                    pass
+                raise requests.exceptions.HTTPError(
+                    f"{e} | body: {detail}", response=resp
+                ) from e
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError) as e:
                 if attempt < max_retries - 1:
                     # Reset the session to clear stale SSL state (fixes post-sleep errors)
@@ -155,6 +166,18 @@ class KalshiClient:
         ⚠️  This sends a REAL order if KALSHI_ENV=PROD.
         In DEMO mode, orders are simulated on Kalshi's demo platform.
         """
+        # Pre-validation to catch issues before hitting the API
+        count = int(count)
+        if count < 1 or count > 10000:
+            raise ValueError(f"Invalid contract count {count} for {ticker} (must be 1-10000)")
+        price = yes_price if yes_price is not None else no_price
+        if price is not None and (price < 1 or price > 99):
+            raise ValueError(f"Invalid price {price}c for {ticker} (must be 1-99)")
+        if side not in ("yes", "no"):
+            raise ValueError(f"Invalid side '{side}' for {ticker} (must be 'yes' or 'no')")
+        if action not in ("buy", "sell"):
+            raise ValueError(f"Invalid action '{action}' for {ticker} (must be 'buy' or 'sell')")
+
         order = {
             "ticker": ticker,
             "side": side,

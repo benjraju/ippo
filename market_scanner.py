@@ -31,8 +31,16 @@ class MarketScanner:
         all_markets = []
 
         # First do a broad scan (no series filter) to catch all active markets
+        blocked = getattr(config, "BLOCKED_SERIES", set())
         try:
             markets = self._scan_series(None)
+            # Filter out markets from blocked series (e.g., KXNBAPTS)
+            if blocked:
+                markets = [
+                    m for m in markets
+                    if m.get("series", "").split("-")[0] not in blocked
+                    and m.get("ticker", "").split("-")[0] not in blocked
+                ]
             all_markets.extend(markets)
         except Exception as e:
             console.print(f"  [yellow]Warning: Broad scan failed: {e}[/yellow]")

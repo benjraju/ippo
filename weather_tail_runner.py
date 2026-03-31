@@ -34,6 +34,12 @@ except ImportError:
     print("ERROR: weather_tail_strategy.py not found")
     sys.exit(1)
 
+# Import settlement timing strategy
+try:
+    from settlement_timing_strategy import find_settlement_timing_trades
+except ImportError:
+    find_settlement_timing_trades = None
+
 # Setup logging
 LOG_FILE = config.OUTPUT_DIR / "weather_tail_runner.log"
 log = logging.getLogger("weather_tail_runner")
@@ -59,18 +65,18 @@ def get_balance(client):
 
 
 def get_existing_positions(client):
-    """Get set of tickers we already have positions on."""
+    """Get dict of tickers we already have positions on, with contract counts."""
     try:
         pos = client.get_positions()
-        existing = set()
+        existing = {}
         for p in pos.get("market_positions", []):
             fp = float(p.get("position_fp", 0) or 0)
             if fp != 0:
-                existing.add(p.get("ticker", ""))
+                existing[p.get("ticker", "")] = int(abs(fp))
         return existing
     except Exception as e:
         log.error(f"Positions fetch failed: {e}")
-        return set()
+        return {}
 
 
 def run(dry_run=True):
@@ -78,6 +84,14 @@ def run(dry_run=True):
     log.info(f"{'[DRY RUN] ' if dry_run else ''}Weather tail scan starting")
 
     client = KalshiClient()
+
+    # Cancel stale resting orders before placing new ones (frees capital)
+    try:
+        from auto_trade import cleanup_stale_orders
+        cleanup_stale_orders(client, log, max_age_hours=3.0, dry_run=dry_run)
+    except Exception as e:
+        log.warning(f"Stale order cleanup failed: {e}")
+
     balance = get_balance(client)
     if balance is None:
         log.error("Could not get balance, aborting")
@@ -114,26 +128,54 @@ def run(dry_run=True):
     remaining_balance = balance
     placed = 0
 
+    # Cap: max 8 contracts per ticker across all cycles (prevent accumulation)
+    MAX_CONTRACTS_PER_TICKER = 8
+
     for tt in tail_trades:
         if placed >= max_per_cycle:
             break
 
         ticker = tt["ticker"]
 
-        # Skip if we already have a position
-        if ticker in existing:
-            log.debug(f"  SKIP {ticker}: already have position")
+        # Skip if we already have enough contracts on this ticker
+        current_contracts = existing.get(ticker, 0)
+        if current_contracts >= MAX_CONTRACTS_PER_TICKER:
+            log.debug(f"  SKIP {ticker}: already {current_contracts} contracts (max {MAX_CONTRACTS_PER_TICKER})")
             continue
+
+        # Only add enough to reach the cap
+        room = MAX_CONTRACTS_PER_TICKER - current_contracts
+
+        # Scale contract count by confidence (same logic as auto_trade.py)
+        our_no_prob = tt.get("our_no_prob", 0.98)
+        budget_max = risk.get("max_contracts", 5)
+        if our_no_prob >= 0.995:
+            prob_max = budget_max  # Near-certain
+        elif our_no_prob >= 0.98:
+            prob_max = max(1, int(budget_max * 0.75))
+        else:
+            prob_max = max(1, int(budget_max * 0.5))
+
+        # Dutch book sizing: scale by market overpricing signal
+        db_total = tt.get("dutch_book_total", 100)
+        if db_total < 102:
+            prob_max = max(1, int(prob_max * 0.5))
+        elif db_total < 110:
+            scale = 0.5 + 0.5 * (db_total - 102) / 8
+            prob_max = max(1, int(prob_max * scale))
 
         contracts = min(
             tt.get("suggested_contracts", 1),
-            risk.get("max_contracts", 5),
-            3,  # hard cap per trade
+            prob_max,
+            4,  # hard cap per trade
+            room,  # don't exceed per-ticker cap
         )
         if contracts <= 0:
             continue
 
-        price_cents = int(tt.get("no_price_cents", 97))
+        raw_no_price = int(tt.get("no_price_cents", 97))
+        # Bid 1c below the NO ask to stay as maker (avoid "post only cross")
+        price_cents = max(1, raw_no_price - 1)
         cost = contracts * price_cents / 100.0
 
         # Balance check
@@ -171,7 +213,84 @@ def run(dry_run=True):
                 f"YES@{yes_price}c edge={edge:.1f}c"
             )
 
-    log.info(f"Done: {placed} orders placed, ${remaining_balance:.2f} remaining")
+    log.info(f"Weather tail done: {placed} orders placed, ${remaining_balance:.2f} remaining")
+
+    # --- Settlement timing (near-risk-free, after 2 PM local) ---
+    if find_settlement_timing_trades is not None:
+        try:
+            log.info("--- Settlement timing scan ---")
+            st_trades = find_settlement_timing_trades(client)
+            if not st_trades:
+                log.info("No settlement timing opportunities (wrong time or no known outcomes)")
+            else:
+                log.info(f"Found {len(st_trades)} settlement timing opportunities")
+                MAX_ST_PER_TICKER = 5
+                st_placed = 0
+
+                for st in st_trades[:8]:
+                    if st_placed >= 8:
+                        break
+
+                    ticker = st.ticker
+                    current = existing.get(ticker, 0)
+                    if current >= MAX_ST_PER_TICKER:
+                        log.debug(f"  SKIP {ticker}: already {current} contracts")
+                        continue
+                    room = MAX_ST_PER_TICKER - current
+
+                    contracts = min(st.suggested_contracts, room)
+                    if contracts <= 0:
+                        continue
+
+                    if st.side == "yes":
+                        price_cents = max(1, st.yes_price_cents - 1)
+                    else:
+                        price_cents = max(1, st.no_price_cents - 1)
+
+                    cost = contracts * price_cents / 100.0
+                    if cost > remaining_balance - 2.0:
+                        log.info(f"  SKIP {ticker}: cost ${cost:.2f} > remaining ${remaining_balance:.2f}")
+                        continue
+
+                    if not dry_run:
+                        try:
+                            order_kwargs = {
+                                "ticker": ticker,
+                                "side": st.side,
+                                "action": "buy",
+                                "count": contracts,
+                                "type": "limit",
+                            }
+                            if st.side == "yes":
+                                order_kwargs["yes_price"] = price_cents
+                            else:
+                                order_kwargs["no_price"] = price_cents
+                            result = client.place_order(**order_kwargs)
+                            remaining_balance -= cost
+                            st_placed += 1
+                            log.info(
+                                f"  PLACED: {st.side.upper()} {ticker} x{contracts} @{price_cents}c | "
+                                f"obs={st.observed_high_f:.1f}F thresh={st.threshold_f:.0f}F "
+                                f"buf={st.buffer_f:+.1f}F conf={st.confidence}"
+                            )
+                        except Exception as e:
+                            log.warning(f"  FAILED: {ticker} — {e}")
+                    else:
+                        st_placed += 1
+                        remaining_balance -= cost
+                        log.info(
+                            f"  [DRY] {st.side.upper()} {ticker} x{contracts} @{price_cents}c | "
+                            f"obs={st.observed_high_f:.1f}F thresh={st.threshold_f:.0f}F"
+                        )
+
+                log.info(f"Settlement timing done: {st_placed} orders, ${remaining_balance:.2f} remaining")
+        except Exception as e:
+            log.error(f"Settlement timing scan failed: {e}")
+            log.error(traceback.format_exc())
+    else:
+        log.info("Settlement timing module not available")
+
+    log.info(f"All done: ${remaining_balance:.2f} remaining")
 
 
 if __name__ == "__main__":
